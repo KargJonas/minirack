@@ -610,6 +610,18 @@
           "label": "#",
           "name": "${ITEM_NUMBER}",
           "show": false
+        },
+        {
+          "group_by": false,
+          "label": "LCSC",
+          "name": "LCSC",
+          "show": false
+        },
+        {
+          "group_by": false,
+          "label": "Field5",
+          "name": "Field5",
+          "show": false
         }
       ],
       "filter_string": "",
@@ -660,7 +672,7 @@
         "uuid": "b46e9a14-8827-41a7-9091-cc2dee17597f"
       }
     ],
-    "used_designators": "SW1,JP1-8,R1-34,C1-32,#PWR1-80,J1-27,U1-7",
+    "used_designators": "H1-4,SW1,JP1-8,R1-34,C1-32,#PWR1-80,J1-27,U1-7",
     "variants": []
   },
   "sheets": [
