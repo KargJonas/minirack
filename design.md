@@ -10,9 +10,36 @@
 | ATX supply | PicoPSU (strict 12 V version) | Fed from regulated 12.0 V bus. |
 | Router | Dedicated OpenWrt device (NanoPi R-series / GL.iNet class), 12 V input | Rack is its own network, router is its root. Independent of the server: N100 can reboot without dropping VPN/network; KVM stays reachable out of band. |
 | NAS | Existing DS223j | 12 V bus. Hibernates during outages (load shedding). |
-| Switch | 8-port non-PoE, 12 V input | PoE via individual 12->48 V 802.3af injectors only where needed (Meshtastic runs off 12 V directly). |
-| KVM | JetKVM/PiKVM class | Reachable via router/VPN even while the server is down. |
 | Monitoring | MCU + RTC, I2C sensors | INA226/INA3221 per rail, battery shunt (coulomb counting + mains-loss detection), AGM midpoint divider, temp/humidity, mic, IMU, diff. pressure. |
+
+## Rack monitoring setup (and battery protection)
+
+For reading all sensors, getting voltages, currents and power draw, controlling relays etc, we use a WT32-ETH01 micro-controller module.
+The WT32 is based on the ESP32-WROOM-32 (ESP32-D0WDQ6, Xtensa dual-core 32-bit LX6 microprocessor, up to 240 MHz), and provides an ethernet port, such that the ESP stays accessible even when other components go down (except for the router).
+
+For precise power monitoring, we use 3x ADS131M02IRUKR dual-channel ADCs @ 32MHz.
+To monitor power draw at the wall, we use one of the ADCs with a CT on one channel and a PT on the other.
+This allows us to measure current and voltage waveforms highly precisely, since the channels are synced.
+We use a second ADC, but without transformers, on the 12V rail to get power draw and voltage stability there.
+The third ADC is unused (but I added it regardless since that means the board can be used e.g. for 3-phase power monitoring purposes in other projects).
+To get the battery voltage, current and power statistics, we should be able to tap into the JK BMS, and this data is also where we make the decision to dispatch a system shutdown command to the devices in case the battery level is critically low.
+To prevent deep discharge, we could also add a relay that opens after the shutdown is complete.
+Whether or not that disconnects *all* devices from the battery or everything but the ESP-board remains open.
+
+The board (`eda/rack-manager`) carries the WT32-ETH01, the three ADS131M02 ADCs, a TCA9548A I2C mux and a PCA9555 GPIO expander. All three ADCs share a single `CLKIN` and are synchronized via IO15 of the ESP32. This means they are phase-locked across chips.
+The clock signal comes from the LEDC output of the ESP32. Since clock stability directly impacts ADC performance, I did some tests with an ESP32 I had laying around to see how good the clock signal we produce with the ESP is. Here are the results:
+
+This was captured on a cheap 24MHz logic analyzer.
+The period histogram captures the fraction of periods measured at each whole-sample length. A clean clock collapses to a single bin, a dithered one smears across two.
+
+| Freq set      | Window / cycles  | Avg measured | Error    | Duty   | Period histogram                       | Drop/glitch |
+| ------------- | ---------------- | ------------ | -------- | ------ | -------------------------------------- | ----------- |
+| **4.000 MHz** | 200 ms / 799,955 | 3.99978 MHz  | 54.8 ppm | 50.3 % | **6 smp: 99.91 %** (5:0.03, 7:0.06)    | 0 / 0       |
+| 2.000 MHz     | 200 ms / 399,977 | 1.99989 MHz  | 54.8 ppm | 50.2 % | **12 smp: 99.90 %** (11:0.02, 13:0.08) | 0 / 0       |
+| 8.192 MHz     | 100 ms / 819,155 | 8.19155 MHz  | 54.5 ppm | ~50 %  | 2 smp / 3 smp smeared (std 10.7 ns)    | 0 / 0       |
+| 1.024 MHz     | 200 ms / 204,788 | 1.02394 MHz  | 54.6 ppm | 51.1 % | 23 smp / 24 smp (straddles 976.6 ns)   | 0 / 0       |
+
+We'll likely go with 4MHz, which gives us a clean signal, while still allowing 32MHz captures, and thus 16MHz bandwidth on the ADC, which should be enough for harmonic analysis.
 
 ## Power architecture
 
@@ -35,37 +62,19 @@ flowchart TD
 - Star wiring from bus bar, not stacked lugs; 2.5 mm2 branches. Top-balance cells before first assembly; compression fixture for the prismatic pack.
 - Runtime: ~27 h full load / ~38 h shed (50Ah); router stays powered in shed mode (VPN up during outages). Wall-to-device efficiency ~86 %; on battery ~94 % (no inverter).
 
-## Monitoring 3V3 rail budget (WT32-ETH01)
+## 3V3 rail power budget
 
 The MCU peripherals run off the WT32-ETH01's onboard 3.3 V LDO. Combined draw is small enough that the rail is a non-issue.
 
 | Load | Count | Per-device (max) | Subtotal |
 |---|---|---|---|
 | ADS131M02 ADC (HR mode) | 3 | 2.15 mA AVDD + 0.35 mA DVDD = 2.5 mA | 7.5 mA |
-| TCA9548A I2C mux | 1 | ~35 µA operating | ~0.1 mA |
-| AHT20+BMP280 boards | 8 | ~µA idle, ~0.7-1 mA the one channel being read | ~2-8 mA |
+| TCA9548A I2C mux | 1 | ~35 uA operating | ~0.1 mA |
+| AHT20+BMP280 boards | 8 | ~uA idle, ~0.7-1 mA the one channel being read | ~2-8 mA |
 | I2C pull-ups (main + active channel) | - | ~0.33 mA per pulled-low line | ~1-2 mA |
 | **Total** | | | **~12-30 mA** |
 
-- Mux switches the I2C **bus only, not power** - all 8 sensor boards are powered continuously, but only the selected channel's sensor converts at a time; the other 7 sit at idle (~µA).
-- WT32-ETH01 baseline (ESP32 + LAN8720 PHY) is ~150-200 mA; even a 500 mA-class onboard LDO leaves ~300 mA headroom, ~10x what these peripherals need. Wired Ethernet only - keep the WiFi radio off so the ESP32 doesn't spike the LDO's total budget with ~500 mA TX bursts.
-- **Check the specific AHT20+BMP280 module:** bare variants (native 3.3 V, 2 pull-ups) draw ~µA idle; variants with a power LED add ~1-2 mA each (~10-16 mA for 8), and variants with an onboard 5->3.3 V LDO should be fed from 5 V instead of the WT32's 3V3 rail. Add a bulk cap near the sensor cluster for the 8x decoupling-cap inrush at power-up.
+## Upgrade paths
 
-## Upgrade paths (architecture stays fixed)
-
-- **Solar:** MPPT controller straight onto the 24 V bus.
-- **PoE at scale:** only if many loads - would justify native 48 V instead of injectors.
-
-## Shopping list (power system v1)
-
-Full costed list: components.ods, **Iteration 5** (~EUR 1,096 all-in incl. compute/rack/network).
-
-- Mean Well NPB-360-24**TB** - ~EUR 100 at TME/Reichelt (not Amazon); programmable variant preferred (see float caveat above)
-- 8x EVE LF50K LiFePO4 3.2 V 50Ah, grade A, same batch - ~EUR 136
-- JK BMS JK-B1A8S10P (1 A active balance, UART/RS485 for MCU SOC readout) - ~EUR 40
-- Cell compression fixture + pack hardware (busbars usually ship with the cells)
-- **Victron Orion-Tr 24/12-20 (240W), non-isolated** (`ORI241220200`) - EUR 90-110 at TME/Reichelt; verify cheap listings aren't the 120W model. 18-35 V in covers the 8S LiFePO4 bus; fixed 12.5 V out sits safely under the PicoPSU's ~13-13.5 V OV shutdown; 97% synchronous buck-boost, no fan. Not the Mean Well SD-350B-12 (80%, built-in fan) or the isolated Orion-Tr (~87%, isolation not needed on a common battery-negative bus).
-- Optional at the 12 V blade-fuse block input: 1000-2200 uF low-ESR electrolytic + 100 nF, as ripple/inrush insurance.
-- Optional LVD module (or Victron BatteryProtect) - BMS cell UV cutoff already covers this
-- MIDI fuse + holder (20 A), blade-fuse block, 2.5 mm2 wire, lugs + hex crimper
-- 5 V wall wart -> GPIO as mains-present detector
+- **Solar:** MPPT controller onto the 24 V bus
+- **PoE**
