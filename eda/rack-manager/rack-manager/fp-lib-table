@@ -1,0 +1,5 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "footprints") (type "KiCad") (uri "${KIPRJMOD}/footprints.pretty") (options "") (descr ""))
+	(lib (name "rack-manager") (type "KiCad") (uri "/home/jonas/code/minirack/eda/rack-manager/rack-manager.pretty") (options "") (descr ""))
+)
