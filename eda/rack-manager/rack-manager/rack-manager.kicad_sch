@@ -5752,12 +5752,6 @@
 		(uuid "60403d36-2128-4abb-b345-87a09049361e")
 	)
 	(junction
-		(at 147.32 84.455)
-		(diameter 0)
-		(color 0 0 0 0)
-		(uuid "60a332d0-6e11-477c-89e2-a33e919dbc13")
-	)
-	(junction
 		(at 319.79 96.52)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -6130,6 +6124,12 @@
 		(uuid "f6d6d858-74f4-4ae1-9a81-5b2681b82828")
 	)
 	(junction
+		(at 144.78 84.455)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "f9abe95f-515e-4bc7-8bdb-f412ebe3e5d3")
+	)
+	(junction
 		(at 171.45 106.045)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -6142,12 +6142,12 @@
 		(uuid "fd785d96-c4db-47ce-990c-6adfc474067d")
 	)
 	(no_connect
-		(at 128.27 219.075)
-		(uuid "a42f1c71-b280-4409-b5c5-696125c5be2a")
+		(at 128.27 84.455)
+		(uuid "970f4531-0a74-4c01-b214-0aa63cc12c53")
 	)
 	(no_connect
-		(at 128.27 151.765)
-		(uuid "bdf36b97-20d4-4007-87e0-cfceb1068c82")
+		(at 128.27 219.075)
+		(uuid "a42f1c71-b280-4409-b5c5-696125c5be2a")
 	)
 	(bus_entry
 		(at 268.605 228.6)
@@ -7777,6 +7777,16 @@
 	)
 	(wire
 		(pts
+			(xy 144.78 151.765) (xy 144.78 84.455)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "419bab6f-2858-4d4d-b798-b22a52ace466")
+	)
+	(wire
+		(pts
 			(xy 128.27 211.455) (xy 137.16 211.455)
 		)
 		(stroke
@@ -9057,6 +9067,16 @@
 	)
 	(wire
 		(pts
+			(xy 128.27 151.765) (xy 144.78 151.765)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "935c6600-5e4a-4908-bd8d-f4b8626ffbff")
+	)
+	(wire
+		(pts
 			(xy 110.49 60.325) (xy 110.49 57.785)
 		)
 		(stroke
@@ -9587,7 +9607,7 @@
 	)
 	(wire
 		(pts
-			(xy 147.32 57.785) (xy 147.32 60.325)
+			(xy 144.78 57.785) (xy 144.78 60.325)
 		)
 		(stroke
 			(width 0)
@@ -9667,7 +9687,7 @@
 	)
 	(wire
 		(pts
-			(xy 147.32 67.945) (xy 147.32 84.455)
+			(xy 144.78 67.945) (xy 144.78 84.455)
 		)
 		(stroke
 			(width 0)
@@ -9717,7 +9737,7 @@
 	)
 	(wire
 		(pts
-			(xy 147.32 84.455) (xy 163.83 84.455)
+			(xy 144.78 84.455) (xy 163.83 84.455)
 		)
 		(stroke
 			(width 0)
@@ -10724,16 +10744,6 @@
 			(type default)
 		)
 		(uuid "f88b9baa-fefd-4535-986a-3da10981ff61")
-	)
-	(wire
-		(pts
-			(xy 128.27 84.455) (xy 147.32 84.455)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "f980cc7c-6c3b-420f-8171-656e99b7b34f")
 	)
 	(wire
 		(pts
@@ -14444,7 +14454,7 @@
 	)
 	(symbol
 		(lib_id "Device:R")
-		(at 147.32 64.135 0)
+		(at 144.78 64.135 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -14454,7 +14464,7 @@
 		(dnp no)
 		(uuid "2453aad1-a776-4422-b3b2-0fe6dca4966b")
 		(property "Reference" "R13"
-			(at 142.24 60.325 0)
+			(at 139.7 60.325 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -14465,7 +14475,7 @@
 			)
 		)
 		(property "Value" "100k"
-			(at 147.32 66.675 90)
+			(at 144.78 66.675 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -14476,7 +14486,7 @@
 			)
 		)
 		(property "Footprint" "Resistor_SMD:R_0603_1608Metric"
-			(at 145.542 64.135 90)
+			(at 143.002 64.135 90)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -14487,7 +14497,7 @@
 			)
 		)
 		(property "Datasheet" "0603WAF1003T5E"
-			(at 147.32 64.135 0)
+			(at 144.78 64.135 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -14498,7 +14508,7 @@
 			)
 		)
 		(property "Description" "Resistor"
-			(at 147.32 64.135 0)
+			(at 144.78 64.135 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -14509,7 +14519,7 @@
 			)
 		)
 		(property "LCSC" "C25803"
-			(at 147.32 66.675 90)
+			(at 144.78 66.675 90)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -16539,7 +16549,7 @@
 	)
 	(symbol
 		(lib_id "power:+3V3")
-		(at 147.32 57.785 0)
+		(at 144.78 57.785 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -16550,7 +16560,7 @@
 		(fields_autoplaced yes)
 		(uuid "4414d96b-750d-4ea0-93e3-2c126ec36fdc")
 		(property "Reference" "#PWR025"
-			(at 147.32 61.595 0)
+			(at 144.78 61.595 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -16561,7 +16571,7 @@
 			)
 		)
 		(property "Value" "+3V3"
-			(at 147.32 52.705 0)
+			(at 144.78 52.705 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -16571,7 +16581,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 147.32 57.785 0)
+			(at 144.78 57.785 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -16582,7 +16592,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 147.32 57.785 0)
+			(at 144.78 57.785 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -16593,7 +16603,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"+3V3\""
-			(at 147.32 57.785 0)
+			(at 144.78 57.785 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
