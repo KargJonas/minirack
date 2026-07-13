@@ -5,9 +5,7 @@
     "auto_track_width": true,
     "hidden_netclasses": [],
     "hidden_nets": [
-      "GND",
-      "+3V3",
-      "+5V"
+      "GND"
     ],
     "high_contrast_mode": 0,
     "net_color_mode": 1,
@@ -28,7 +26,7 @@
       "lockedItems": false,
       "otherItems": true,
       "pads": true,
-      "text": false,
+      "text": true,
       "tracks": true,
       "vias": true,
       "zones": true
@@ -56,8 +54,8 @@
       "board_outline_area",
       "ly_points"
     ],
-    "visible_layers": "ffffffff_ffffffff_ffffffff_f7ffff5f",
-    "zone_display_mode": 1
+    "visible_layers": "ffffffff_ffffffff_ffffffff_77ffff4f",
+    "zone_display_mode": 0
   },
   "git": {
     "integration_disabled": false,
