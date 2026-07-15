@@ -13487,7 +13487,7 @@
 		(in_pos_files yes)
 		(dnp no)
 		(uuid "1bbbe6f7-e59f-4226-8cb1-61868b80dacf")
-		(property "Reference" "U3"
+		(property "Reference" "ADC2"
 			(at 100.33 198.755 0)
 			(show_name no)
 			(do_not_autoplace no)
@@ -13610,7 +13610,7 @@
 		(instances
 			(project "rack-manager"
 				(path "/b46e9a14-8827-41a7-9091-cc2dee17597f"
-					(reference "U3")
+					(reference "ADC2")
 					(unit 1)
 				)
 			)
@@ -18152,7 +18152,7 @@
 				(justify right)
 			)
 		)
-		(property "Value" "SW_Push"
+		(property "Value" "C720477"
 			(at 153.035 131.445 0)
 			(hide yes)
 			(show_name no)
@@ -22668,7 +22668,7 @@
 		(in_pos_files yes)
 		(dnp no)
 		(uuid "c6315fc6-692e-4c7f-94a7-6b0ab6c0bc54")
-		(property "Reference" "U2"
+		(property "Reference" "ADC1"
 			(at 100.33 131.445 0)
 			(show_name no)
 			(do_not_autoplace no)
@@ -22802,7 +22802,7 @@
 		(instances
 			(project "rack-manager"
 				(path "/b46e9a14-8827-41a7-9091-cc2dee17597f"
-					(reference "U2")
+					(reference "ADC1")
 					(unit 1)
 				)
 			)
@@ -25233,7 +25233,7 @@
 		(in_pos_files yes)
 		(dnp no)
 		(uuid "ebfc9664-b906-42fa-b44c-cfcefe2e73f5")
-		(property "Reference" "U1"
+		(property "Reference" "ADC3"
 			(at 100.33 64.135 0)
 			(show_name no)
 			(do_not_autoplace no)
@@ -25356,7 +25356,7 @@
 		(instances
 			(project "rack-manager"
 				(path "/b46e9a14-8827-41a7-9091-cc2dee17597f"
-					(reference "U1")
+					(reference "ADC3")
 					(unit 1)
 				)
 			)
