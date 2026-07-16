@@ -3,5 +3,9 @@
   "version": "0.1.0",
   "description": "HTTP OTA endpoints for minirack apps: /update (raw .bin via curl), /loader (reboot into factory loader), /reboot. Cancels bootloader rollback on begin().",
   "frameworks": "arduino",
-  "platforms": "espressif32"
+  "platforms": "espressif32",
+  "dependencies": {
+    "esp32async/AsyncTCP": "^3.3.2",
+    "esp32async/ESPAsyncWebServer": "^3.7.0"
+  }
 }

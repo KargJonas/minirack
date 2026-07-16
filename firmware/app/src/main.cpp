@@ -22,6 +22,22 @@
 
 #define APP_VERSION "clock-test built " __DATE__ " " __TIME__
 
+#if defined(APP_USE_WIFI)
+static bool tryWifi(const String &ssid, const String &pass, uint32_t timeoutMs)
+{
+    Serial.printf("wifi: trying '%s' ", ssid.c_str());
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    uint32_t t0 = millis();
+    while (millis() - t0 < timeoutMs) {
+        if (WiFi.status() == WL_CONNECTED) return true;
+        delay(250);
+        Serial.print(".");
+    }
+    WiFi.disconnect();
+    return false;
+}
+#endif
+
 /* Distinct frequencies need distinct LEDC timers; channels n and n+1 share
  * timer n/2, so use even channels only. Resolution must satisfy
  * freq * 2^bits <= 80MHz. */
@@ -37,9 +53,16 @@ void setup()
     Serial.begin(115200);
     Serial.println("\n" APP_VERSION);
 
+#ifdef CRASH_TEST
+    /* rollback drill: die before RackOTA.begin() can validate the image */
+    Serial.println("CRASH_TEST: aborting before validation");
+    delay(200);
+    abort();
+#endif
+
 #if defined(APP_USE_ETH)
     ETH.begin(1, 16, 23, 18, ETH_PHY_LAN8720, ETH_CLOCK_GPIO0_IN);
-    ETH.setHostname("minirack");
+    ETH.setHostname(RackOTA.hostname().c_str());
     while (!ETH.linkUp() || ETH.localIP() == IPAddress()) {
         delay(250);
         Serial.print(".");
@@ -47,13 +70,20 @@ void setup()
     Serial.printf("\nethernet up: %s\n", ETH.localIP().toString().c_str());
 #else
     WiFi.mode(WIFI_STA);
-    WiFi.setHostname("minirack");
-    WiFi.begin(APP_WIFI_SSID, APP_WIFI_PASS);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(250);
-        Serial.print(".");
+    WiFi.setHostname(RackOTA.hostname().c_str());
+    /* GUI-configured credentials first; fall back to the compiled-in ones so
+     * a typo saved via the web form can't strand the board */
+    String ssid = RackOTA.wifiSsid(APP_WIFI_SSID);
+    String pass = RackOTA.wifiPass(APP_WIFI_PASS);
+    while (true) {
+        if (tryWifi(ssid, pass, 20000)) break;
+        Serial.printf("\n'%s' failed, trying compiled-in '%s'\n",
+                      ssid.c_str(), APP_WIFI_SSID);
+        if (tryWifi(APP_WIFI_SSID, APP_WIFI_PASS, 20000)) break;
+        Serial.println("\nstill no wifi, retrying both");
     }
-    Serial.printf("\nwifi up: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("\nwifi up: %s (%s)\n",
+                  WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
 #endif
 
     RackOTA.begin(APP_VERSION);

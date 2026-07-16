@@ -1,53 +1,79 @@
 #pragma once
 /*
- * RackOTA — keep every minirack app updatable over HTTP, same UX as the loader:
+ * RackOTA. Keep every minirack app updatable and inspectable over HTTP:
  *
- *   GET  /         app info
- *   POST /update   raw app image -> other OTA slot, reboot into it
- *                  curl --data-binary @firmware.bin http://<ip>/update
- *   POST /loader   reboot into the factory loader
- *   POST /reboot   just reboot
+ *   GET  /             tiny HTML GUI: status, firmware upload, config
+ *   GET  /status       one JSON object with everything (identity, slots,
+ *                      memory, config) - the machine-readable interface
+ *   POST /update       raw app image -> other OTA slot, reboot into it
+ *                      curl --data-binary @firmware.bin http://<ip>/update
+ *   POST /update-form  same, as multipart/form-data (used by the GUI form)
+ *   POST /config       persist hostname / wifi ssid / wifi pass to NVS + reboot
+ *   POST /loader       reboot into the factory loader
+ *   POST /reboot       just reboot
  *
  * Usage:
  *   void setup() { ...network up...; RackOTA.begin("my-app v1"); }
  *   void loop()  { RackOTA.handle(); }
  *
- * begin() also calls esp_ota_mark_app_valid_cancel_rollback(): the loader's
- * bootloader is built with app rollback enabled, so an app that crashes
- * before reaching begin() is rolled back automatically on the next reset.
+ * Built on ESPAsyncWebServer: requests are served from the async_tcp task,
+ * so handle() only runs deferred reboots - but keep calling it from loop().
+ *
+ * Rollback: the bootloader boots fresh uploads in "pending verify" state and
+ * RackOTA.begin() marks them valid; RackOTA also overrides the core's weak
+ * verifyRollbackLater() so a crash anywhere before begin() reverts to the
+ * previous image on the next reset.
  */
 
 #include <Arduino.h>
 
-class WebServer;
+class AsyncWebServer;
+class AsyncWebServerRequest;
 
 class RackOTAClass {
 public:
-    /* Call once after the network is up. appInfo is shown on GET /. */
+    /* Call once after the network is up. appInfo is shown on / and /status. */
     void begin(const char *appInfo = "", uint16_t port = 80);
-    /* Call from loop(). */
+    /* Call from loop(). Only services deferred reboots; HTTP is async. */
     void handle();
 
     /* The underlying server, for registering app-specific routes after begin(). */
-    WebServer *server() { return _server; }
+    AsyncWebServer *server() { return _server; }
 
     /* Called right before an OTA/HTTP-triggered restart, e.g. to park pins
      * in a safe state (strapping pins!). */
     void onReboot(void (*cb)()) { _onReboot = cb; }
 
+    /* Persisted config (NVS namespace "rackota"), editable via the GUI.
+     * Falls back to the given default while unset. Read these in setup()
+     * for your network bringup - and keep a compiled-in fallback so a bad
+     * SSID entered in the GUI can't strand the board. */
+    String hostname(const char *def = "minirack") { return configValue("hostname", def); }
+    String wifiSsid(const char *def = "") { return configValue("ssid", def); }
+    String wifiPass(const char *def = "") { return configValue("pass", def); }
+
+
 private:
-    void handleInfo();
-    void handleUpdateData();
-    void handleUpdateDone();
-    void handleLoader();
-    void handleReboot();
+    String configValue(const char *key, const char *def);
+
+    void handleRoot(AsyncWebServerRequest *req);
+    String rootToken(const String &var);
+    void handleStatus(AsyncWebServerRequest *req);
+    void handleConfig(AsyncWebServerRequest *req);
+    void handleUpdateData(AsyncWebServerRequest *req, uint8_t *data, size_t len,
+                          size_t index, size_t total);
+    void handleUpdateForm(AsyncWebServerRequest *req, const String &filename,
+                          size_t index, uint8_t *data, size_t len, bool final);
+    void handleUpdateDone(AsyncWebServerRequest *req);
+    void handleLoader(AsyncWebServerRequest *req);
     void scheduleReboot();
 
-    WebServer *_server = nullptr;
+    AsyncWebServer *_server = nullptr;
     String _info;
     void (*_onReboot)() = nullptr;
-    bool _rebootPending = false;
-    uint32_t _rebootAt = 0;
+    /* written from the async_tcp task, polled from loop() */
+    volatile bool _rebootPending = false;
+    volatile uint32_t _rebootAt = 0;
 };
 
 extern RackOTAClass RackOTA;

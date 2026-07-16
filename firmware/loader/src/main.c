@@ -29,6 +29,7 @@
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
 #include "esp_partition.h"
+#include "esp_timer.h"
 #include "esp_http_server.h"
 
 #if defined(LOADER_USE_WIFI)
@@ -203,6 +204,44 @@ static esp_err_t info_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, buf, n);
 }
 
+/* Same JSON shape as RackOTA's /status, so clients (flash.sh) can poll one
+ * endpoint and tell from "role" whether they reached the loader or an app. */
+static esp_err_t status_get_handler(httpd_req_t *req)
+{
+    const esp_app_desc_t *desc = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+
+    char sha[65];
+    for (int i = 0; i < 32; i++)
+        sprintf(sha + 2 * i, "%02x", desc->app_elf_sha256[i]);
+
+    char buf[768];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"role\":\"loader\",\"info\":\"minirack loader %s\","
+        "\"built\":\"%s %s\",\"partition\":\"%s\",\"elf_sha256\":\"%s\","
+        "\"uptime_s\":%lld,\"slots\":{",
+        desc->version, desc->date, desc->time,
+        running ? running->label : "?", sha,
+        esp_timer_get_time() / 1000000);
+
+    esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_APP,
+                                                     ESP_PARTITION_SUBTYPE_ANY, NULL);
+    bool first = true;
+    for (; it != NULL; it = esp_partition_next(it)) {
+        const esp_partition_t *p = esp_partition_get(it);
+        n += snprintf(buf + n, sizeof(buf) - n, "%s\"%s\":\"%s\"",
+                      first ? "" : ",", p->label,
+                      p->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY ? "loader"
+                                                                      : ota_state_str(p));
+        first = false;
+    }
+    esp_partition_iterator_release(it);
+    n += snprintf(buf + n, sizeof(buf) - n, "}}\n");
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, buf, n);
+}
+
 static esp_err_t update_post_handler(httpd_req_t *req)
 {
     const esp_partition_t *dst = esp_ota_get_next_update_partition(NULL);
@@ -325,6 +364,7 @@ static void http_start(void)
 
     const httpd_uri_t routes[] = {
         { .uri = "/",       .method = HTTP_GET,  .handler = info_get_handler },
+        { .uri = "/status", .method = HTTP_GET,  .handler = status_get_handler },
         { .uri = "/update", .method = HTTP_POST, .handler = update_post_handler },
         { .uri = "/boot",   .method = HTTP_POST, .handler = boot_post_handler },
         { .uri = "/reboot", .method = HTTP_POST, .handler = reboot_post_handler },

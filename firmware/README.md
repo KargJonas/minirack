@@ -15,24 +15,42 @@ flash (4MB)                       partitions_4mb.csv (shared by all builds)
 
 - **`loader/`**: the program is programmed into `factory` flash section. It is never overwritten by OTA updates. The loader brings up network hardware/software and serves an HTTP API endpoint that can be used to easily flash software over the network. This part of the code uses the ESP-IDF framework, which is not required in the user-flashed applications.
 - **`app/`**: demo app / template. Any Arduino-framework firmware works, as long as it includes **`lib/RackOTA`** so it stays updatable.
-- **`lib/RackOTA`**: Arduino lib providing the same `/update` endpoint in the   app itself (direct app-to-app updates), `/loader` to get back to the loader, and the rollback handshake.
+- **`lib/RackOTA`**: Arduino lib providing the same `/update` endpoint in the   app itself (direct app-to-app updates), `/loader` to get back to the loader, and the rollback handshake. Built on [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer): requests are served from the async_tcp task, so a busy `loop()` can't stall HTTP; `RackOTA.handle()` only runs deferred reboots.
 
-### Safety net
+### Safe flashing
 
-The bootloader is built with app rollback (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). A freshly uploaded app boots in "pending verify" state; `RackOTA.begin()` marks it valid. If an app crashes before that, the next reset rolls back to the previous image (ultimately the loader). Consequence: **an app that doesn't call `RackOTA.begin()` is reverted on its next reboot** - by design.
+The bootloader is built with app rollback (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). A freshly uploaded app boots in "pending verify" state; `RackOTA.begin()` marks it valid. If the app crashes anywhere before that, the next reset rolls back to the previous image (ultimately the loader). Verified end-to-end with a deliberately crashing app (`pio run` with `-DCRASH_TEST`).
+
+RackOTA overrides the Arduino core's weak `verifyRollbackLater()`. Otherwise, the core would auto-validate the image before `setup()` even runs, and a crash in `setup()` would boot-loop forever instead of rolling back.
+
+**Always include RackOTA.** An app without it validates itself at boot, serves no endpoints, and can only be replaced via serial.
+
+### Verified flashing: flash.sh
+
+```sh
+./flash.sh <host> firmware.bin   # exit 0: uploaded build successfully running
+```
+
+Uploads, waits for the reboot, then proves *the exact build you uploaded* is what runs: every ESP32 image embeds a unique per-build SHA-256 (at file offset 176), which the device reports via `GET /status` (JSON: role, partition, elf_sha256, uptime, slot states). Exit 1 = device came back with a different image (rolled back), 2 = device never came back.
 
 ## HTTP API (same on loader and apps)
 
 ```sh
-curl http://<ip>/                                     # info / partition states
+curl http://<ip>/status                               # one JSON object: image hash,
+                                                      # slot states, memory, config
 curl --data-binary @firmware.bin http://<ip>/update   # flash + boot new app
 curl -X POST http://<ip>/reboot
 
 # loader only:
+curl http://<ip>/                                     # text info page
 curl -X POST "http://<ip>/boot?part=factory"          # or ota_0 / ota_1
 
 # apps only:
+# GET / serves a tiny no-js web GUI: status, firmware upload form, and
+# config (hostname / wifi ssid / wifi password, persisted in NVS; the demo
+# app falls back to compiled-in wifi creds if the configured ones fail).
 curl -X POST http://<ip>/loader                       # reboot into loader
+curl -d "hostname=rack1&ssid=&pass=" http://<ip>/config  # empty = default/unchanged
 ```
 
 The device requests hostname `minirack-loader` (loader) / `minirack` (app)
