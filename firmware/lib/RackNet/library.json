@@ -1,0 +1,7 @@
+{
+  "name": "RackNet",
+  "version": "1.0.0",
+  "description": "Shared network bringup (WT32-ETH01 ethernet or WiFi station with NVS-configured credentials) for minirack firmware",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

@@ -26,6 +26,29 @@ want_sha=$(xxd -p -s 176 -l 32 "$bin" | tr -d '\n')
 get()   { curl -fsS -m 3 "http://$host/$1" 2>/dev/null; }
 field() { grep -o "\"$2\":\"[^\"]*\"" <<<"$1" | head -1 | cut -d'"' -f4; }
 
+# Explain *why* the upload was rolled back, from the survivor's /status
+# diagnostics: the reset reason survives the rollback reboot, the rejected
+# image stays in its slot marked "aborted", and the panic handler left a
+# core dump (task, PC, backtrace) in the coredump partition.
+diag() {
+    local st=$1 reset abslot absha celf bt
+    reset=$(field "$st" last_reset)
+    [ -n "$reset" ] && echo "  last reset: $reset" >&2
+    abslot=$(field "$st" aborted_slot)
+    absha=$(field "$st" aborted_sha)
+    if [ -n "$abslot" ] && [ "$absha" = "$want_sha" ]; then
+        echo "  your image booted and was rejected; it sits in $abslot marked aborted" >&2
+    fi
+    celf=$(field "$st" crash_elf)
+    if [ -n "$celf" ] && [ "${want_sha:0:${#celf}}" = "$celf" ]; then
+        bt=$(field "$st" crash_bt)
+        echo "  crash: task '$(field "$st" crash_task)' at $(field "$st" crash_pc)," \
+             "cause $(grep -o '"crash_cause":[0-9]*' <<<"$st" | cut -d: -f2)" >&2
+        echo "  backtrace: $bt" >&2
+        echo "  decode:    xtensa-esp32-elf-addr2line -e .pio/build/<env>/firmware.elf $bt" >&2
+    fi
+}
+
 echo "uploading $(stat -c %s "$bin") bytes (${want_sha:0:12}...) to http://$host/update"
 curl -fsS --data-binary @"$bin" "http://$host/update"
 
@@ -42,6 +65,7 @@ while (( SECONDS - start < timeout )); do
         fi
         if [ "$(field "$status" role)" = "loader" ]; then
             echo "FAILED: device fell back to the loader — the app crashed before validating" >&2
+            diag "$status"
             exit 1
         fi
         # A different app answered. Freshly rebooted -> it's the rollback
@@ -49,6 +73,7 @@ while (( SECONDS - start < timeout )); do
         up=$(grep -o '"uptime_s":[0-9]*' <<<"$status" | cut -d: -f2)
         if [ -n "$up" ] && (( up < elapsed + 3 )); then
             echo "FAILED: device rolled back to previous image (\"$(field "$status" info)\" in $part)" >&2
+            diag "$status"
             exit 1
         fi
     elif info=$(get ""); then

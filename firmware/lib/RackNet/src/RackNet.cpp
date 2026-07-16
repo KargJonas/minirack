@@ -1,0 +1,58 @@
+#include "RackNet.h"
+#include <RackOTA.h>
+
+#if defined(RACK_USE_ETH)
+#include <ETH.h>
+
+void rackNetBegin()
+{
+    /* WT32-ETH01: LAN8720 PHY addr 1, MDC=GPIO23, MDIO=GPIO18, 50MHz clock
+     * in on GPIO0 from the external oscillator, oscillator enable on GPIO16 */
+    ETH.begin(1, 16, 23, 18, ETH_PHY_LAN8720, ETH_CLOCK_GPIO0_IN);
+    ETH.setHostname(RackOTA.hostname().c_str());
+    while (!ETH.linkUp() || ETH.localIP() == IPAddress()) {
+        delay(250);
+        Serial.print(".");
+    }
+    Serial.printf("\nethernet up: %s\n", ETH.localIP().toString().c_str());
+}
+
+#elif defined(RACK_USE_WIFI)
+#include <WiFi.h>
+
+static bool tryWifi(const String &ssid, const String &pass, uint32_t timeoutMs)
+{
+    Serial.printf("wifi: trying '%s' ", ssid.c_str());
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    uint32_t t0 = millis();
+    while (millis() - t0 < timeoutMs) {
+        if (WiFi.status() == WL_CONNECTED) return true;
+        delay(250);
+        Serial.print(".");
+    }
+    WiFi.disconnect();
+    return false;
+}
+
+void rackNetBegin()
+{
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(RackOTA.hostname().c_str());
+    /* GUI-configured credentials first; fall back to the compiled-in ones so
+     * a typo saved via the web form can't strand the board */
+    String ssid = RackOTA.wifiSsid(RACK_WIFI_SSID);
+    String pass = RackOTA.wifiPass(RACK_WIFI_PASS);
+    while (true) {
+        if (tryWifi(ssid, pass, 20000)) break;
+        Serial.printf("\n'%s' failed, trying compiled-in '%s'\n",
+                      ssid.c_str(), RACK_WIFI_SSID);
+        if (tryWifi(RACK_WIFI_SSID, RACK_WIFI_PASS, 20000)) break;
+        Serial.println("\nstill no wifi, retrying both");
+    }
+    Serial.printf("\nwifi up: %s (%s)\n",
+                  WiFi.localIP().toString().c_str(), WiFi.SSID().c_str());
+}
+
+#else
+#error "define RACK_USE_WIFI or RACK_USE_ETH"
+#endif

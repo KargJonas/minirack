@@ -1,16 +1,23 @@
 #pragma once
 /*
- * RackOTA. Keep every minirack app updatable and inspectable over HTTP:
+ * RackOTA. Keep every minirack firmware updatable and inspectable over HTTP:
  *
- *   GET  /             tiny HTML GUI: status, firmware upload, config
+ *   GET  /             tiny HTML GUI: status, rollback diagnostics, firmware
+ *                      upload, config
  *   GET  /status       one JSON object with everything (identity, slots,
- *                      memory, config) - the machine-readable interface
- *   POST /update       raw app image -> other OTA slot, reboot into it
+ *                      memory, config, rollback diagnostics) - the
+ *                      machine-readable interface
+ *   POST /update       raw app image -> spare OTA slot, reboot into it
  *                      curl --data-binary @firmware.bin http://<ip>/update
  *   POST /update-form  same, as multipart/form-data (used by the GUI form)
  *   POST /config       persist hostname / wifi ssid / wifi pass to NVS + reboot
- *   POST /loader       reboot into the factory loader
+ *   POST /boot?part=<label>  boot a specific partition (loader|ota_0|ota_1)
+ *   POST /loader       reboot into the loader (apps only; = /boot?part=loader)
  *   POST /reboot       just reboot
+ *
+ * The same class serves apps and the loader itself: running from the factory
+ * partition it reports role "loader" in /status, hides the "reboot into
+ * loader" action, and skips the rollback validation handshake.
  *
  * Usage:
  *   void setup() { ...network up...; RackOTA.begin("my-app v1"); }
@@ -65,11 +72,17 @@ private:
     void handleUpdateForm(AsyncWebServerRequest *req, const String &filename,
                           size_t index, uint8_t *data, size_t len, bool final);
     void handleUpdateDone(AsyncWebServerRequest *req);
+    bool updateTooBig(size_t bodySize, size_t slack);
+    void handleBoot(AsyncWebServerRequest *req);
     void handleLoader(AsyncWebServerRequest *req);
     void scheduleReboot();
 
     AsyncWebServer *_server = nullptr;
     String _info;
+    bool _isLoader = false;
+    /* set instead of touching Update when an upload is rejected up front;
+     * only accessed from the async_tcp task */
+    String _updateErr;
     void (*_onReboot)() = nullptr;
     /* written from the async_tcp task, polled from loop() */
     volatile bool _rebootPending = false;
