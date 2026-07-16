@@ -1,0 +1,7 @@
+{
+  "name": "RackOTA",
+  "version": "0.1.0",
+  "description": "HTTP OTA endpoints for minirack apps: /update (raw .bin via curl), /loader (reboot into factory loader), /reboot. Cancels bootloader rollback on begin().",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

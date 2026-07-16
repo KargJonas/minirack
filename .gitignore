@@ -1,2 +1,4 @@
 **/.~lock.*.ods#
 **/~*.*.lck
+firmware/secrets.ini
+**/.pio/
