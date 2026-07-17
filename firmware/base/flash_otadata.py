@@ -1,7 +1,7 @@
-# Serial-flashing the loader also resets otadata (the boot-slot selector at
-# 0xe000): a board whose otadata points at an OTA slot would otherwise keep
-# booting the old app instead of the freshly flashed loader. Blank (0xFF)
-# otadata makes the bootloader pick the factory-subtype partition.
+# Serial-flashing the base image also resets otadata (the boot-slot selector
+# at 0xe000): a board whose otadata points at ota_1 would otherwise keep
+# booting whatever sits there instead of the freshly flashed ota_0. Blank
+# (0xFF) otadata makes the bootloader fall back to the first OTA slot.
 Import("env")
 import os
 

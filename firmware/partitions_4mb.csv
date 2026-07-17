@@ -1,13 +1,13 @@
-# Shared partition table for minirack boards (4MB flash).
-# The loader lives in "loader" (subtype factory = what the bootloader falls
-# back to) and is only ever flashed over serial. Apps are uploaded over HTTP
-# into ota_0/ota_1 (image is position-independent across slots thanks to the
-# MMU, so one .bin works for both). coredump holds the crash dump of the most
-# recent panic, which RackOTA reports via /status for rollback diagnostics.
+# Shared partition table for minirack boards (4MB flash). Plain A/B:
+# the serial flash puts the base image (RackOTA only) into ota_0; every HTTP
+# upload goes to the slot not currently running. A bad upload rolls back to
+# the previous image; bad-but-validated images are handled by RackOTA's
+# crash-loop guard and reachability watchdog (see lib/RackOTA).
+# coredump holds the crash dump of the most recent panic, reported via
+# /status for rollback diagnostics.
 # Name,     Type, SubType,  Offset,   Size
 nvs,        data, nvs,      0x9000,   0x5000,
 otadata,    data, ota,      0xe000,   0x2000,
-loader,     app,  factory,  0x10000,  0x130000,
-ota_0,      app,  ota_0,    0x140000, 0x150000,
-ota_1,      app,  ota_1,    0x290000, 0x150000,
-coredump,   data, coredump, 0x3e0000, 0x20000,
+ota_0,      app,  ota_0,    0x10000,  0x1e0000,
+ota_1,      app,  ota_1,    0x1f0000, 0x1e0000,
+coredump,   data, coredump, 0x3d0000, 0x30000,

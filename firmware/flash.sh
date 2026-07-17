@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Upload an app image over HTTP and verify the device actually runs it.
-# Works against the loader or a running RackOTA app.
 #
 #   usage: flash.sh <host> <firmware.bin> [timeout_s]
 #
@@ -50,7 +49,10 @@ diag() {
 }
 
 echo "uploading $(stat -c %s "$bin") bytes (${want_sha:0:12}...) to http://$host/update"
-curl -fsS --data-binary @"$bin" "http://$host/update"
+# explicit content type: curl's default (x-www-form-urlencoded) would make the
+# async server parse the image as a form
+curl -fsS -H 'Content-Type: application/octet-stream' --data-binary @"$bin" \
+     "http://$host/update"
 
 start=$SECONDS
 sleep 3
@@ -63,23 +65,12 @@ while (( SECONDS - start < timeout )); do
             echo "OK: new image is running from $part (after ${elapsed}s)"
             exit 0
         fi
-        if [ "$(field "$status" role)" = "loader" ]; then
-            echo "FAILED: device fell back to the loader — the app crashed before validating" >&2
-            diag "$status"
-            exit 1
-        fi
-        # A different app answered. Freshly rebooted -> it's the rollback
+        # A different image answered. Freshly rebooted -> it's the rollback
         # fallback; long uptime -> the old app hasn't rebooted yet, keep waiting.
         up=$(grep -o '"uptime_s":[0-9]*' <<<"$status" | cut -d: -f2)
         if [ -n "$up" ] && (( up < elapsed + 3 )); then
             echo "FAILED: device rolled back to previous image (\"$(field "$status" info)\" in $part)" >&2
             diag "$status"
-            exit 1
-        fi
-    elif info=$(get ""); then
-        # loaders flashed before /status existed: identify by the info page
-        if grep -q "minirack loader" <<<"$info"; then
-            echo "FAILED: device fell back to the loader — the app crashed before validating" >&2
             exit 1
         fi
     fi

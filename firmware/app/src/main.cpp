@@ -1,5 +1,5 @@
 /*
- * minirack clock test — outputs hardware clocks (LEDC, 50% duty) on the pins
+ * minirack clock test. This outputs hardware clocks (LEDC, 50% duty) on the pins
  * currently wired to the logic analyzer:
  *
  *   LA ch1  GPIO0   1 kHz    (strapping pin: parked high before OTA reboots)
@@ -12,6 +12,9 @@
 #include <Arduino.h>
 #include <RackOTA.h>
 #include <RackNet.h>
+#ifdef WD_TEST
+#include <WiFi.h>
+#endif
 
 #define APP_VERSION "clock-test built " __DATE__ " " __TIME__
 
@@ -39,6 +42,13 @@ void setup()
 
     rackNetBegin();
     RackOTA.begin(APP_VERSION);
+
+#ifdef WD_TEST
+    /* watchdog drill: a validated image whose server is unreachable - the
+     * reachability watchdog must reboot once, then roll back */
+    Serial.println("WD_TEST: killing the network after validation");
+    WiFi.mode(WIFI_OFF);
+#endif
     /* GPIO0 straps to download mode if sampled low during a reboot */
     RackOTA.onReboot([]() {
         ledcDetachPin(0);
@@ -56,6 +66,16 @@ void setup()
 void loop()
 {
     RackOTA.handle();
+
+#ifdef CRASH_LOOP_TEST
+    /* safeguard drill: a VALIDATED image that crash-loops - the crash-loop
+     * guard must roll back to the previous image after 3 attempts */
+    if (millis() > 15000) {
+        Serial.println("CRASH_LOOP_TEST: aborting after validation");
+        delay(100);
+        abort();
+    }
+#endif
 
     static uint32_t lastBeat = 0;
     if (millis() - lastBeat >= 10000) {

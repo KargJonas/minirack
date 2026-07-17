@@ -6,11 +6,129 @@
 #include "esp_system.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_netif.h"
+#include "esp_rom_sys.h"
+#include "lwip/sockets.h"
 #if __has_include("esp_core_dump.h")
 #include "esp_core_dump.h"
 #endif
 
 RackOTAClass RackOTA;
+
+/* ------------------------------------------------------------------ */
+/* Safeguards. A/B rollback only covers images that crash before        */
+/* validating; a bad-but-VALIDATED image would be booted forever and    */
+/* lock us out of a board with no UART. Two layers, both escaping via   */
+/* otadata to the previous image:                                       */
+/*  - crash-loop guard (constructor, pre-setup): 3 crash resets in a    */
+/*    row without 5 min of stable uptime -> mark this image invalid     */
+/*  - reachability watchdog (own task): HTTP server must answer a       */
+/*    loopback probe; 5 min of failures -> reboot (cures heap leaks,    */
+/*    wedged tasks); still failing after that reboot -> mark invalid    */
+/* State lives in RTC memory: survives resets, cleared on power-on.     */
+/* ------------------------------------------------------------------ */
+
+#define GUARD_MAGIC       0x52474431 /* "RGD1" */
+#define GUARD_CRASH_LIMIT 3
+#define GUARD_STABLE_MS   (5 * 60 * 1000)
+#define WD_PROBE_MS       15000
+#ifndef RACKOTA_WD_FAIL_MS
+#define RACKOTA_WD_FAIL_MS (5 * 60 * 1000)
+#endif
+
+RTC_NOINIT_ATTR static uint32_t guardMagic;
+RTC_NOINIT_ATTR static uint32_t guardCrashes;
+RTC_NOINIT_ATTR static uint32_t guardWdStage;
+
+/* Global-constructor time, i.e. before setup() - so a validated image
+ * that crashes even in setup() still gets counted and escaped from. */
+RackOTAClass::RackOTAClass()
+{
+    if (guardMagic != GUARD_MAGIC) { /* power-on: RTC RAM is garbage */
+        guardMagic = GUARD_MAGIC;
+        guardCrashes = 0;
+        guardWdStage = 0;
+    }
+    esp_reset_reason_t r = esp_reset_reason();
+    if (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
+        r == ESP_RST_TASK_WDT || r == ESP_RST_WDT) {
+        if (++guardCrashes >= GUARD_CRASH_LIMIT) {
+            guardCrashes = 0; /* don't re-fire every boot if rollback is impossible */
+            esp_rom_printf("[RackOTA] %d crash resets in a row, rolling back\n",
+                           GUARD_CRASH_LIMIT);
+            esp_ota_mark_app_invalid_rollback_and_reboot(); /* no return on success */
+            esp_rom_printf("[RackOTA] rollback impossible (no valid other slot)\n");
+        }
+    }
+}
+
+static bool haveIp()
+{
+    for (esp_netif_t *n = esp_netif_next(NULL); n; n = esp_netif_next(n)) {
+        esp_netif_ip_info_t ip;
+        if (esp_netif_is_netif_up(n) &&
+            esp_netif_get_ip_info(n, &ip) == ESP_OK && ip.ip.addr)
+            return true;
+    }
+    return false;
+}
+
+/* Full round trip through lwip and the async_tcp task: if this answers,
+ * a client on the wire would be served too (modulo link/PHY, which the
+ * haveIp() check approximates). */
+static bool probeSelf(uint16_t port)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return false;
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in a = {};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bool ok = false;
+    if (connect(s, (struct sockaddr *)&a, sizeof(a)) == 0) {
+        const char req[] = "GET /status HTTP/1.0\r\n\r\n";
+        if (send(s, req, sizeof(req) - 1, 0) > 0) {
+            char c;
+            ok = recv(s, &c, 1, 0) > 0;
+        }
+    }
+    close(s);
+    return ok;
+}
+
+void RackOTAClass::wdEntry(void *self)
+{
+    ((RackOTAClass *)self)->watchdogTask();
+}
+
+void RackOTAClass::watchdogTask()
+{
+    uint32_t firstFail = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(WD_PROBE_MS));
+        if (haveIp() && probeSelf(_port)) {
+            firstFail = 0;
+            guardWdStage = 0;
+            continue;
+        }
+        if (!firstFail) firstFail = millis();
+        if (millis() - firstFail < RACKOTA_WD_FAIL_MS) continue;
+        if (Update.isRunning()) continue; /* never yank the rug mid-upload */
+        if (guardWdStage == 0) {
+            guardWdStage = 1;
+            Serial.println("[RackOTA] watchdog: server unreachable, rebooting");
+        } else {
+            Serial.println("[RackOTA] watchdog: unreachable across a reboot, rolling back");
+            esp_ota_mark_app_invalid_rollback_and_reboot();
+            /* only reached if there is no valid other slot: reboot and retry */
+        }
+        if (_onReboot) _onReboot();
+        ESP.restart();
+    }
+}
 
 /* The Arduino core auto-validates a pending image in initArduino() -- before
  * setup() runs -- which would defeat rollback for apps that crash in setup().
@@ -45,15 +163,14 @@ static String runningSha()
     return sha256Hex(esp_ota_get_app_description()->app_elf_sha256);
 }
 
-/* ------------------------------------------------------------------ */
-/* Rollback diagnostics. After the bootloader reverts a bad upload,     */
-/* three artifacts explain what happened, and we surface all of them:  */
+/* ------------------------------------------------------------------  */
+/* Rollback diagnostics. After the bootloader reverts a bad upload,    */
 /*  - the reset reason of the crash survives in RTC (panic/wdt/...)    */
 /*  - the rejected image sits in its slot marked "aborted", with its   */
 /*    per-build sha still readable from the image header               */
 /*  - the panic handler wrote a core dump to the coredump partition:   */
 /*    crashing task, PC, backtrace (addr2line-able against the .elf)   */
-/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------  */
 
 static const char *resetReasonName()
 {
@@ -93,7 +210,6 @@ static bool abortedSlot(String &slot, String &sha)
                                                      ESP_PARTITION_SUBTYPE_ANY, NULL);
     for (; it != NULL; it = esp_partition_next(it)) {
         const esp_partition_t *p = esp_partition_get(it);
-        if (p->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) continue;
         esp_ota_img_states_t st;
         if (esp_ota_get_state_partition(p, &st) != ESP_OK) continue;
         if (st != ESP_OTA_IMG_ABORTED && st != ESP_OTA_IMG_INVALID) continue;
@@ -152,10 +268,15 @@ static String slotList()
         const esp_partition_t *p = esp_partition_get(it);
         if (slots.length()) slots += ", ";
         slots += String(p->label) + "=";
-        slots += (p->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) ? "loader" : otaStateName(p);
+        slots += otaStateName(p);
     }
     esp_partition_iterator_release(it);
     return slots;
+}
+
+static String pct(uint32_t used, uint32_t total)
+{
+    return total ? String(used * 100 / total) + "%" : String("?");
 }
 
 static String htmlEscape(String s)
@@ -164,6 +285,16 @@ static String htmlEscape(String s)
     s.replace("<", "&lt;");
     s.replace(">", "&gt;");
     s.replace("\"", "&quot;");
+    return s;
+}
+
+/* For values substituted into ROOT_TMPL: a literal '%' inside a value gets
+ * rescanned by the template processor and re-pairs the placeholder
+ * delimiters, garbling the rest of the page - emit it as an entity. */
+static String tmplEscape(String s)
+{
+    s = htmlEscape(s);
+    s.replace("%", "&#37;");
     return s;
 }
 
@@ -183,19 +314,40 @@ String RackOTAClass::configValue(const char *key, const char *def)
     return v;
 }
 
+/* curl --data-binary defaults to Content-Type: application/x-www-form-urlencoded,
+ * which ESPAsyncWebServer parses by accumulating the WHOLE body in a heap
+ * String (the streaming body callback is bypassed) - for a firmware-sized
+ * upload that is a guaranteed OOM abort mid-request. This handler catches
+ * such requests first; it reports "trivial" (the default), so the library
+ * discards the body instead of parsing it, and the client gets told what to
+ * send. flash.sh and the docs use application/octet-stream. */
+class PlainPostUpdateGuard : public AsyncWebHandler {
+public:
+    bool canHandle(AsyncWebServerRequest *req) const override
+    {
+        return req->method() == HTTP_POST && req->url() == "/update" &&
+               req->contentType().startsWith("application/x-www-form-urlencoded");
+    }
+    void handleRequest(AsyncWebServerRequest *req) override
+    {
+        req->send(400, "text/plain",
+                  "body would be parsed as a form and exhaust RAM; resend as:\n"
+                  "curl -H 'Content-Type: application/octet-stream' "
+                  "--data-binary @firmware.bin http://<ip>/update\n");
+    }
+};
+
 void RackOTAClass::begin(const char *appInfo, uint16_t port)
 {
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    _isLoader = running && running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY;
-
-    /* We survived until here: keep this image across reboots. (The loader
-     * partition has no otadata state to validate.) */
-    if (!_isLoader) esp_ota_mark_app_valid_cancel_rollback();
+    /* We survived until here: keep this image across reboots. */
+    esp_ota_mark_app_valid_cancel_rollback();
 
     _info = appInfo;
+    _port = port;
     _server = new AsyncWebServer(port);
     _server->on("/", HTTP_GET, [this](AsyncWebServerRequest *req) { handleRoot(req); });
     _server->on("/status", HTTP_GET, [this](AsyncWebServerRequest *req) { handleStatus(req); });
+    _server->addHandler(new PlainPostUpdateGuard()); /* must precede /update */
     _server->on("/update", HTTP_POST,
                 [this](AsyncWebServerRequest *req) { handleUpdateDone(req); },
                 nullptr,
@@ -211,17 +363,22 @@ void RackOTAClass::begin(const char *appInfo, uint16_t port)
                 });
     _server->on("/config", HTTP_POST, [this](AsyncWebServerRequest *req) { handleConfig(req); });
     _server->on("/boot", HTTP_POST, [this](AsyncWebServerRequest *req) { handleBoot(req); });
-    if (!_isLoader)
-        _server->on("/loader", HTTP_POST, [this](AsyncWebServerRequest *req) { handleLoader(req); });
     _server->on("/reboot", HTTP_POST, [this](AsyncWebServerRequest *req) {
-        req->send(200, "text/plain", "OK, rebooting\n");
+        sendActionPage(req, "OK, rebooting");
         scheduleReboot();
     });
     _server->begin();
+
+    xTaskCreate(wdEntry, "rackota_wd", 4096, this, 5, NULL);
 }
 
 void RackOTAClass::handle()
 {
+    /* survived long enough: a later crash streak counts from zero */
+    if (!_stableMarked && millis() > GUARD_STABLE_MS) {
+        _stableMarked = true;
+        guardCrashes = 0;
+    }
     if (_rebootPending && (int32_t)(millis() - _rebootAt) >= 0) {
         if (_onReboot) _onReboot();
         ESP.restart();
@@ -232,6 +389,36 @@ void RackOTAClass::scheduleReboot()
 {
     _rebootAt = millis() + 750; /* let the response drain first */
     _rebootPending = true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Responses to actions that reboot the board. curl gets plain text;   */
+/* browsers get a page that polls until the board answers again and    */
+/* then reloads the GUI.                                               */
+/* ------------------------------------------------------------------ */
+
+static bool wantsHtml(AsyncWebServerRequest *req)
+{
+    return req->hasHeader("Accept") &&
+           req->getHeader("Accept")->value().indexOf("text/html") >= 0;
+}
+
+void RackOTAClass::sendActionPage(AsyncWebServerRequest *req, const String &msg)
+{
+    if (!wantsHtml(req)) {
+        req->send(200, "text/plain", msg + "\n");
+        return;
+    }
+    /* first poll after 2 s: the reboot fires at +750 ms, so by then a
+     * response can only come from the freshly booted image */
+    req->send(200, "text/html",
+              "<!DOCTYPE html><html><body><h1>" + htmlEscape(msg) + "</h1>"
+              "<p>Waiting for the board to come back&hellip;</p>"
+              "<script>async function poll(){"
+              "try{await fetch('/status',{cache:'no-store',signal:AbortSignal.timeout(1500)});"
+              "location.replace('/');}"
+              "catch(e){setTimeout(poll,1000);}}"
+              "setTimeout(poll,2000);</script></body></html>");
 }
 
 static const char ROOT_TMPL[] PROGMEM = R"html(<!DOCTYPE html>
@@ -247,24 +434,25 @@ SHA-256:    %SHA%
 Partition:  %PART%
 Slots:      %SLOTS%
 Uptime:     %UPTIME% s
-Heap:       %HEAP_FREE% KiB free of %HEAP_SIZE% KiB (min. ever %HEAP_MIN%, largest block %HEAP_BLOCK%)
-Flash:      app uses %FLASH_USED% KiB of %FLASH_SLOT% KiB slot
+Heap:       %HEAP_FREE% KiB free of %HEAP_SIZE% KiB (%HEAP_PCT% used; min. ever %HEAP_MIN%, largest block %HEAP_BLOCK%)
+Flash:      app uses %FLASH_USED% KiB of %FLASH_SLOT% KiB slot (%FLASH_PCT% used)
 Tasks:      %TASKS% (loop stack headroom %STACK% B)
 Last reset: %LAST_RESET%
 %DIAG%
         </pre>
 
         <h2>Upload Firmware</h2>
-        <p>
-            This board keeps two application partitions: the running image and a spare.<br>
-            Uploading firmware writes the spare and reboots into it.<br>
-            If the new application crashes before validating itself, the bootloader rolls<br>
-            back to the previous image, ultimately to the built-in loader, so a bad<br>
-            upload cannot brick the board.
-        </p>
         <form method='POST' action='/update-form' enctype='multipart/form-data'>
             <input type='file' name='fw'> <input type='submit' value='Flash'>
         </form>
+        <p>
+            This board keeps two application partitions: the running image and a spare.<br>
+            Uploading firmware writes the spare and reboots into it.<br>
+            If the new application crashes before validating itself, the bootloader<br>
+            rolls back to the previous image; images that break later are caught by<br>
+            a crash-loop guard and a reachability watchdog, so a bad upload cannot<br>
+            lock you out of the board.
+        </p>
 
         <h2>Configuration</h2>
         <p>
@@ -282,7 +470,10 @@ Last reset: %LAST_RESET%
 
         <h2>Actions</h2>
         <form method='POST' action='/reboot'><input type='submit' value='Reboot'></form>
-        %LOADER_FORM%
+        <form method='POST' action='/boot'>
+            <select name='part'>%BOOT_OPTS%</select>
+            <input type='submit' value='Boot Selected Slot'>
+        </form>
     </body>
 </html>
 )html";
@@ -293,19 +484,21 @@ String RackOTAClass::rootToken(const String &var)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
 
-    if (var == "HOST" || var == "CFG_HOST") return htmlEscape(hostname());
-    if (var == "INFO")       return htmlEscape(_info);
-    if (var == "CFG_SSID")   return htmlEscape(wifiSsid());
+    if (var == "HOST" || var == "CFG_HOST") return tmplEscape(hostname());
+    if (var == "INFO")       return tmplEscape(_info);
+    if (var == "CFG_SSID")   return tmplEscape(wifiSsid());
     if (var == "SHA")        return runningSha();
     if (var == "PART")       return running ? running->label : "?";
     if (var == "SLOTS")      return slotList();
     if (var == "UPTIME")     return String(millis() / 1000);
     if (var == "HEAP_FREE")  return String(ESP.getFreeHeap() / 1024);
     if (var == "HEAP_SIZE")  return String(ESP.getHeapSize() / 1024);
+    if (var == "HEAP_PCT")   return tmplEscape(pct(ESP.getHeapSize() - ESP.getFreeHeap(), ESP.getHeapSize()));
     if (var == "HEAP_MIN")   return String(ESP.getMinFreeHeap() / 1024);
     if (var == "HEAP_BLOCK") return String(ESP.getMaxAllocHeap() / 1024);
     if (var == "FLASH_USED") return String(ESP.getSketchSize() / 1024);
     if (var == "FLASH_SLOT") return String(running ? running->size / 1024 : 0);
+    if (var == "FLASH_PCT")  return tmplEscape(pct(ESP.getSketchSize(), running ? running->size : 0));
     if (var == "TASKS")      return String(uxTaskGetNumberOfTasks());
     if (var == "STACK")      return String(uxTaskGetStackHighWaterMark(NULL));
     if (var == "LAST_RESET") return resetReasonName();
@@ -316,7 +509,7 @@ String RackOTAClass::rootToken(const String &var)
                    sha.substring(0, 16) + "...)\n";
         CrashInfo c = crashInfo();
         if (c.valid) {
-            out += "Last crash:  task '" + htmlEscape(c.task) + "' at " + c.pc +
+            out += "Last crash: task '" + tmplEscape(c.task) + "' at " + c.pc +
                    ", cause " + String(c.cause);
             if (*excCauseName(c.cause)) out += " " + String(excCauseName(c.cause));
             out += "\n             backtrace: " + c.bt + "  (crashing build " + c.elf + ")";
@@ -324,10 +517,30 @@ String RackOTAClass::rootToken(const String &var)
         if (out.endsWith("\n")) out.remove(out.length() - 1);
         return out;
     }
-    if (var == "LOADER_FORM")
-        return _isLoader ? String() :
-            String("<form method='POST' action='/loader'>"
-                   "<input type='submit' value='Reboot into Loader'></form>");
+    if (var == "BOOT_OPTS") {
+        /* one <option> per slot: state + build sha; the persistent boot
+         * target is preselected. Rollback/safeguards still override the
+         * selection if the chosen image fails. */
+        const esp_partition_t *boot = esp_ota_get_boot_partition();
+        String out;
+        esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_APP,
+                                                         ESP_PARTITION_SUBTYPE_ANY, NULL);
+        for (; it != NULL; it = esp_partition_next(it)) {
+            const esp_partition_t *p = esp_partition_get(it);
+            out += "<option value='" + String(p->label) + "'";
+            if (p == boot) out += " selected";
+            out += ">" + String(p->label) + " - " + otaStateName(p);
+            esp_app_desc_t d;
+            if (esp_ota_get_partition_description(p, &d) == ESP_OK)
+                out += ", " + sha256Hex(d.app_elf_sha256).substring(0, 8);
+            else
+                out += ", empty";
+            if (p == running) out += " (running)";
+            out += "</option>";
+        }
+        esp_partition_iterator_release(it);
+        return out;
+    }
     return String();
 }
 
@@ -348,11 +561,17 @@ void RackOTAClass::handleStatus(AsyncWebServerRequest *req)
     /* identity: elf_sha256 is the per-build hash the toolchain embeds in
      * every image; the same bytes sit at offset 176 of the .bin, so a client
      * (flash.sh) can prove the exact image it uploaded is what runs now */
-    String s = String("{\"role\":\"") + (_isLoader ? "loader" : "app") + "\",";
+    String s = "{\"api\":2,";
     s += "\"info\":\"" + jsonEscape(_info) + "\",";
     s += "\"partition\":\"" + String(running ? running->label : "?") + "\",";
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    s += "\"boot_partition\":\"" + String(boot ? boot->label : "?") + "\",";
     s += "\"elf_sha256\":\"" + runningSha() + "\",";
     s += "\"uptime_s\":" + String(millis() / 1000) + ",";
+
+    /* safeguard state (see crash-loop guard / reachability watchdog) */
+    s += "\"guard\":{\"crash_resets\":" + String(guardCrashes) +
+         ",\"wd_stage\":" + String(guardWdStage) + "},";
 
     /* rollback diagnostics; flat keys so grep-based clients (flash.sh) can
      * extract them without a JSON parser */
@@ -383,7 +602,7 @@ void RackOTAClass::handleStatus(AsyncWebServerRequest *req)
         if (!first) s += ",";
         first = false;
         s += "\"" + String(p->label) + "\":\"";
-        s += (p->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) ? "loader" : otaStateName(p);
+        s += otaStateName(p);
         s += "\"";
     }
     esp_partition_iterator_release(it);
@@ -436,7 +655,7 @@ void RackOTAClass::handleConfig(AsyncWebServerRequest *req)
         prefs.putString("pass", req->getParam("pass", true)->value());
     }
     prefs.end();
-    req->send(200, "text/plain", "config saved, rebooting\n");
+    sendActionPage(req, "config saved, rebooting");
     scheduleReboot();
 }
 
@@ -507,7 +726,7 @@ void RackOTAClass::handleUpdateDone(AsyncWebServerRequest *req)
         Update.clearError();
         return;
     }
-    req->send(200, "text/plain", "OK: update written, rebooting into it\n");
+    sendActionPage(req, "OK: update written, rebooting into it");
     scheduleReboot();
 }
 
@@ -515,11 +734,16 @@ void RackOTAClass::handleUpdateDone(AsyncWebServerRequest *req)
 
 void RackOTAClass::handleBoot(AsyncWebServerRequest *req)
 {
-    if (!req->hasParam("part")) {
-        req->send(400, "text/plain", "use /boot?part=loader|ota_0|ota_1\n");
+    /* query string (curl) or form body (the GUI's slot selector) */
+    String part;
+    if (req->hasParam("part"))
+        part = req->getParam("part")->value();
+    else if (req->hasParam("part", true))
+        part = req->getParam("part", true)->value();
+    if (!part.length()) {
+        req->send(400, "text/plain", "use /boot?part=ota_0|ota_1\n");
         return;
     }
-    String part = req->getParam("part")->value();
     const esp_partition_t *p = esp_partition_find_first(
         ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, part.c_str());
     if (!p) {
@@ -531,23 +755,7 @@ void RackOTAClass::handleBoot(AsyncWebServerRequest *req)
         req->send(500, "text/plain", String(esp_err_to_name(err)) + "\n");
         return;
     }
-    req->send(200, "text/plain", "OK, rebooting into " + part + "\n");
+    sendActionPage(req, "OK, rebooting into " + part);
     scheduleReboot();
 }
 
-void RackOTAClass::handleLoader(AsyncWebServerRequest *req)
-{
-    const esp_partition_t *factory = esp_partition_find_first(
-        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
-    if (!factory) {
-        req->send(500, "text/plain", "no factory partition found\n");
-        return;
-    }
-    esp_err_t err = esp_ota_set_boot_partition(factory);
-    if (err != ESP_OK) {
-        req->send(500, "text/plain", String(esp_err_to_name(err)) + "\n");
-        return;
-    }
-    req->send(200, "text/plain", "OK, rebooting into loader\n");
-    scheduleReboot();
-}

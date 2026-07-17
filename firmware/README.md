@@ -7,29 +7,28 @@ hardware. Everything after the initial flash goes over ethernet via HTTP.
 
 ```
 flash (4MB)                       partitions_4mb.csv (shared by all builds)
-├── bootloader (rollback enabled)
-├── loader   1.19M  <- loader/  minimal recovery image, flashed ONCE over serial
-├── ota_0    1.31M  <- apps, uploaded over HTTP
-├── ota_1    1.31M  <-   "
-└── coredump 128K   <- crash dump of the most recent panic (rollback diagnostics)
+├── bootloader (rollback enabled, never rewritten)
+├── ota_0    1.875M <- A/B slots; serial flash puts the base image here,
+├── ota_1    1.875M <- every HTTP upload goes to the slot not running
+└── coredump 192K   <- crash dump of the most recent panic (diagnostics)
 ```
 
 Everything is a plain Arduino sketch built on the same two libraries — there
 is exactly one implementation of the HTTP API, the OTA logic, and the network
 bringup:
 
-- **`lib/RackOTA`**: all HTTP endpoints (status, upload, config, boot
-  selection, rollback diagnostics) plus the rollback handshake. Built on
+- **`lib/RackOTA`**: all HTTP endpoints (status, upload, config, slot boot,
+  rollback diagnostics) plus the rollback handshake and the safeguards
+  described below. Built on
   [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer):
-  requests are served from the async_tcp task, so a busy `loop()` can't stall
-  HTTP; `RackOTA.handle()` only runs deferred reboots. Detects at runtime
-  whether it runs from the loader partition and adapts (role in `/status`,
-  no "reboot into loader" action).
+  requests are served from the async_tcp task, so a busy `loop()` can't
+  stall HTTP; `RackOTA.handle()` only runs deferred reboots.
 - **`lib/RackNet`**: the one network bringup (`rackNetBegin()`), ethernet or
   WiFi via `-DRACK_USE_ETH` / `-DRACK_USE_WIFI`.
-- **`loader/`**: nothing but `rackNetBegin()` + `RackOTA.begin()`. Lives in
-  the `loader` partition (subtype `factory` — what the bootloader ultimately
-  falls back to), flashed once over serial, never overwritten by OTA.
+- **`base/`**: the minimal image (network + RackOTA, nothing else),
+  serial-flashed into `ota_0` when a board is first commissioned so it is
+  reachable over HTTP from day one. Afterwards it's an ordinary slot
+  occupant — later uploads overwrite it.
 - **`app/`**: demo app / template. Any Arduino firmware works, as long as it
   includes RackOTA so it stays updatable.
 
@@ -37,9 +36,9 @@ bringup:
 
 The bootloader is built with app rollback (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`;
 the prebuilt arduino-esp32 bootloader ships with it enabled). A freshly
-uploaded app boots in "pending verify" state; `RackOTA.begin()` marks it
-valid. If the app crashes anywhere before that, the next reset rolls back to
-the previous image (ultimately the loader).
+uploaded image boots in "pending verify" state; `RackOTA.begin()` marks it
+valid. If it crashes anywhere before that, the next reset rolls back to the
+previous image in the other slot.
 
 RackOTA overrides the Arduino core's weak `verifyRollbackLater()`. Otherwise,
 the core would auto-validate the image before `setup()` even runs, and a
@@ -48,9 +47,29 @@ crash in `setup()` would boot-loop forever instead of rolling back.
 **Always include RackOTA.** An app without it validates itself at boot,
 serves no endpoints, and can only be replaced via serial.
 
-Note: rollback triggers on *resets* (crash, watchdog, power cycle) — an app
-that hangs without crashing keeps hanging until power is cycled, after which
-the pending-verify image is rolled back.
+### Safeguards: escaping bad-but-VALIDATED images
+
+Bootloader rollback only covers images that crash *before* validating. An
+image that validates and *then* turns bad (crash loop after an hour, heap
+exhaustion, wedged server task) would be booted forever and lock us out of a
+board with no UART. RackOTA adds two escape hatches, both landing on the
+previous image in the other slot:
+
+- **Crash-loop guard** (runs before `setup()`): 3 crash resets (panic/WDT)
+  in a row without reaching 5 minutes of uptime → the image is marked
+  invalid, the bootloader boots the other slot. Counted in RTC memory
+  (survives resets, cleared on power-on).
+- **Reachability watchdog** (own FreeRTOS task, priority above `loop()`):
+  probes the board's own HTTP server through lwIP loopback every 15 s.
+  Unreachable for 5 minutes → reboot (cures leaks and wedged tasks); *still*
+  unreachable for 5 minutes after that reboot → mark invalid, boot the other
+  slot. Never fires while an upload is in progress.
+
+Drills (flash, watch it happen, board comes back on the previous image):
+`pio run` with `-DCRASH_TEST` (crash before validation → plain rollback),
+`-DCRASH_LOOP_TEST` (validate, then crash-loop → crash guard),
+`-DWD_TEST` (validate, then kill the network → watchdog escalation; add
+`-DRACKOTA_WD_FAIL_MS=60000` to shorten the drill).
 
 ### Rollback diagnostics
 
@@ -71,6 +90,8 @@ and are reported in `/status` (and on the GUI):
   ```
 
 `flash.sh` prints all of this automatically when an upload gets rolled back.
+`/status` also reports the safeguard state (`guard.crash_resets`,
+`guard.wd_stage`).
 
 ### Verified flashing: flash.sh
 
@@ -84,47 +105,44 @@ offset 176), which the device reports via `GET /status`. Exit 1 = device
 came back with a different image (rolled back — diagnostics get printed),
 2 = device never came back.
 
-## HTTP API (identical on loader and apps)
+## HTTP API
 
 ```sh
-curl http://<ip>/                                     # no-js web GUI: status, rollback
+curl http://<ip>/                                     # web GUI: status, rollback
                                                       # diagnostics, upload form, config
+                                                      # (JS only to auto-reload the GUI
+                                                      # after reboot actions)
 curl http://<ip>/status                               # one JSON object with everything
-curl --data-binary @firmware.bin http://<ip>/update   # flash spare slot + boot it
-                                                      # (rejects images > slot size)
-curl -X POST "http://<ip>/boot?part=loader"           # or ota_0 / ota_1
+curl -H 'Content-Type: application/octet-stream' \
+     --data-binary @firmware.bin http://<ip>/update   # flash other slot + boot it
+                                                      # (rejects images > slot size;
+                                                      # content type required - curl's
+                                                      # form default would be refused)
+curl -X POST "http://<ip>/boot?part=ota_0"            # or ota_1
 curl -X POST http://<ip>/reboot
 curl -d "hostname=rack1&ssid=&pass=" http://<ip>/config  # empty = default/unchanged
-
-# apps only (loader hides it — it IS the loader):
-curl -X POST http://<ip>/loader                       # = /boot?part=loader
 ```
 
-`/status` reports `"role": "loader"` or `"app"`, so clients can tell which
-answered. Loader and apps request the same configured hostname (default
-`minirack`) via DHCP — after a rollback the board stays reachable under the
-same name.
+The device requests the configured hostname (default `minirack`) via DHCP.
 
-## Loader: build + initial serial flash (once per board)
+## Base image: build + initial serial flash (once per board)
 
 ```sh
-cd loader
+cd base
 pio run -e lolin32 -t upload      # dev board on /dev/ttyACM0
 pio run -e wt32-eth01 -t upload   # real board, needs UART adapter + IO0 low at reset
 ```
 
-This flashes bootloader + partition table + blank otadata (so the board boots
-the loader, not a stale OTA slot) + the loader image.
+This flashes bootloader + partition table + blank otadata (so the board
+boots `ota_0`, where the base image lands) + the base image.
 
 ## App: build + upload over HTTP
 
 ```sh
 cd app
 pio run -e lolin32                # or -e wt32-eth01
-curl --data-binary @.pio/build/lolin32/firmware.bin http://<ip>/update
+../flash.sh <ip> .pio/build/lolin32/firmware.bin
 ```
-
-Uploads go through either the loader or a running RackOTA app - same command.
 
 ## Dev setup notes (LOLIN32)
 
@@ -134,9 +152,9 @@ Uploads go through either the loader or a running RackOTA app - same command.
 cp secrets.ini.example secrets.ini      # WiFi creds, LOLIN32 dev setup only
 ```
 
-- WiFi instead of ethernet; credentials are baked in at build time from `secrets.ini` (loader *and* demo app) - reflash/re-upload after changing them.
+- WiFi instead of ethernet; credentials are baked in at build time from `secrets.ini` (base image *and* demo app) - reflash/re-upload after changing them.
 - IO0 tied to GND keeps the chip in the serial bootloader on every reset: fine for flashing, but **lift IO0 to actually run the firmware**.
-- Boards flashed with the pre-2026-07-16 partition table (partition `factory`, other offsets) need one serial `pio run -t upload` from `loader/` — the partitions moved.
+- Boards flashed with an older partition table (three slots with a `loader`/`factory` partition) need one serial `pio run -t upload` from `base/` — the layout changed to plain A/B on 2026-07-16.
 
 ## WT32-ETH01 pinout facts (encoded in the sources)
 

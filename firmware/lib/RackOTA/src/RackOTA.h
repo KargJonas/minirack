@@ -7,29 +7,35 @@
  *   GET  /status       one JSON object with everything (identity, slots,
  *                      memory, config, rollback diagnostics) - the
  *                      machine-readable interface
- *   POST /update       raw app image -> spare OTA slot, reboot into it
- *                      curl --data-binary @firmware.bin http://<ip>/update
+ *   POST /update       raw app image -> the other slot, reboot into it
+ *                      curl -H 'Content-Type: application/octet-stream'
+ *                           --data-binary @firmware.bin http://<ip>/update
  *   POST /update-form  same, as multipart/form-data (used by the GUI form)
  *   POST /config       persist hostname / wifi ssid / wifi pass to NVS + reboot
- *   POST /boot?part=<label>  boot a specific partition (loader|ota_0|ota_1)
- *   POST /loader       reboot into the loader (apps only; = /boot?part=loader)
+ *   POST /boot?part=<label>  boot a specific slot (ota_0|ota_1)
  *   POST /reboot       just reboot
  *
- * The same class serves apps and the loader itself: running from the factory
- * partition it reports role "loader" in /status, hides the "reboot into
- * loader" action, and skips the rollback validation handshake.
+ * Rollback: the bootloader boots fresh uploads in "pending verify" state and
+ * RackOTA.begin() marks them valid; RackOTA also overrides the core's weak
+ * verifyRollbackLater() so a crash anywhere before begin() reverts to the
+ * previous image on the next reset.
+ *
+ * Safeguards against bad-but-validated images (which the bootloader alone
+ * would happily boot forever, locking us out of a board with no UART):
+ *  - crash-loop guard: 3 crash resets (panic/wdt) in a row without reaching
+ *    5 min of uptime -> this image is marked invalid, the bootloader boots
+ *    the previous one. Counted in RTC memory, checked before setup() runs.
+ *  - reachability watchdog: an independent task probes the HTTP server over
+ *    loopback every 15 s. Unreachable for 5 min -> reboot (cures leaks and
+ *    wedged tasks); still unreachable after that reboot -> mark invalid and
+ *    boot the previous image. Override the window with -DRACKOTA_WD_FAIL_MS.
  *
  * Usage:
  *   void setup() { ...network up...; RackOTA.begin("my-app v1"); }
  *   void loop()  { RackOTA.handle(); }
  *
  * Built on ESPAsyncWebServer: requests are served from the async_tcp task,
- * so handle() only runs deferred reboots - but keep calling it from loop().
- *
- * Rollback: the bootloader boots fresh uploads in "pending verify" state and
- * RackOTA.begin() marks them valid; RackOTA also overrides the core's weak
- * verifyRollbackLater() so a crash anywhere before begin() reverts to the
- * previous image on the next reset.
+ * so a busy loop() can't stall HTTP; handle() only runs deferred reboots.
  */
 
 #include <Arduino.h>
@@ -39,6 +45,9 @@ class AsyncWebServerRequest;
 
 class RackOTAClass {
 public:
+    /* Crash-loop accounting runs here, before setup(). */
+    RackOTAClass();
+
     /* Call once after the network is up. appInfo is shown on / and /status. */
     void begin(const char *appInfo = "", uint16_t port = 80);
     /* Call from loop(). Only services deferred reboots; HTTP is async. */
@@ -74,16 +83,20 @@ private:
     void handleUpdateDone(AsyncWebServerRequest *req);
     bool updateTooBig(size_t bodySize, size_t slack);
     void handleBoot(AsyncWebServerRequest *req);
-    void handleLoader(AsyncWebServerRequest *req);
+    void sendActionPage(AsyncWebServerRequest *req, const String &msg);
     void scheduleReboot();
+
+    static void wdEntry(void *self);
+    void watchdogTask();
 
     AsyncWebServer *_server = nullptr;
     String _info;
-    bool _isLoader = false;
+    uint16_t _port = 80;
+    bool _stableMarked = false;
+    void (*_onReboot)() = nullptr;
     /* set instead of touching Update when an upload is rejected up front;
      * only accessed from the async_tcp task */
     String _updateErr;
-    void (*_onReboot)() = nullptr;
     /* written from the async_tcp task, polled from loop() */
     volatile bool _rebootPending = false;
     volatile uint32_t _rebootAt = 0;
