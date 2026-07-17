@@ -1,6 +1,6 @@
 #pragma once
 /*
- * RackOTA. Keep every minirack firmware updatable and inspectable over HTTP:
+ * EasyOTA. Keep any ESP32 firmware updatable and inspectable over HTTP:
  *
  *   GET  /             tiny HTML GUI: status, rollback diagnostics, firmware
  *                      upload, config
@@ -16,7 +16,7 @@
  *   POST /reboot       just reboot
  *
  * Rollback: the bootloader boots fresh uploads in "pending verify" state and
- * RackOTA.begin() marks them valid; RackOTA also overrides the core's weak
+ * EasyOTA.begin() marks them valid; EasyOTA also overrides the core's weak
  * verifyRollbackLater() so a crash anywhere before begin() reverts to the
  * previous image on the next reset.
  *
@@ -28,11 +28,11 @@
  *  - reachability watchdog: an independent task probes the HTTP server over
  *    loopback every 15 s. Unreachable for 5 min -> reboot (cures leaks and
  *    wedged tasks); still unreachable after that reboot -> mark invalid and
- *    boot the previous image. Override the window with -DRACKOTA_WD_FAIL_MS.
+ *    boot the previous image. Override the window with -DEASYOTA_WD_FAIL_MS.
  *
  * Usage:
- *   void setup() { ...network up...; RackOTA.begin("my-app v1"); }
- *   void loop()  { RackOTA.handle(); }
+ *   void setup() { EasyOTA.beginNetwork(); EasyOTA.begin("my-app v1"); }
+ *   void loop()  { EasyOTA.handle(); }
  *
  * Built on ESPAsyncWebServer: requests are served from the async_tcp task,
  * so a busy loop() can't stall HTTP; handle() only runs deferred reboots.
@@ -43,10 +43,20 @@
 class AsyncWebServer;
 class AsyncWebServerRequest;
 
-class RackOTAClass {
+class EasyOTAClass {
 public:
     /* Crash-loop accounting runs here, before setup(). */
-    RackOTAClass();
+    EasyOTAClass();
+
+    /* Bring the network up, blocking until the board has an IP. The build
+     * flags select the interface (see EasyNet.cpp):
+     *   -DEASYOTA_USE_ETH    WT32-ETH01 (LAN8720 pinout baked in)
+     *   -DEASYOTA_USE_WIFI   station mode; EASYOTA_WIFI_SSID / _WIFI_PASS are
+     *                        the compiled-in fallback credentials
+     * GUI-configured WiFi credentials (NVS) are tried first, the compiled-in
+     * ones second, so a typo saved in the web form can't strand the board.
+     * The persisted hostname() is requested via DHCP. */
+    void beginNetwork();
 
     /* Call once after the network is up. appInfo is shown on / and /status. */
     void begin(const char *appInfo = "", uint16_t port = 80);
@@ -60,11 +70,11 @@ public:
      * in a safe state (strapping pins!). */
     void onReboot(void (*cb)()) { _onReboot = cb; }
 
-    /* Persisted config (NVS namespace "rackota"), editable via the GUI.
+    /* Persisted config (NVS namespace "easyota"), editable via the GUI.
      * Falls back to the given default while unset. Read these in setup()
      * for your network bringup - and keep a compiled-in fallback so a bad
      * SSID entered in the GUI can't strand the board. */
-    String hostname(const char *def = "minirack") { return configValue("hostname", def); }
+    String hostname(const char *def = "esp32-easyota") { return configValue("hostname", def); }
     String wifiSsid(const char *def = "") { return configValue("ssid", def); }
     String wifiPass(const char *def = "") { return configValue("pass", def); }
 
@@ -102,4 +112,4 @@ private:
     volatile uint32_t _rebootAt = 0;
 };
 
-extern RackOTAClass RackOTA;
+extern EasyOTAClass EasyOTA;

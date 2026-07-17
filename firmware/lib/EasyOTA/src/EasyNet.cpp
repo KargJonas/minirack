@@ -1,15 +1,20 @@
-#include "RackNet.h"
-#include <RackOTA.h>
+/*
+ * EasyOTA network bringup. Folded into the EasyOTA library so a single
+ * dependency provides both "get on the network" and "stay updatable over it".
+ * Kept in its own translation unit to isolate the heavy ETH.h / WiFi.h
+ * includes and the interface #if.
+ */
+#include "EasyOTA.h"
 
-#if defined(RACK_USE_ETH)
+#if defined(EASYOTA_USE_ETH)
 #include <ETH.h>
 
-void rackNetBegin()
+void EasyOTAClass::beginNetwork()
 {
     /* WT32-ETH01: LAN8720 PHY addr 1, MDC=GPIO23, MDIO=GPIO18, 50MHz clock
      * in on GPIO0 from the external oscillator, oscillator enable on GPIO16 */
     ETH.begin(1, 16, 23, 18, ETH_PHY_LAN8720, ETH_CLOCK_GPIO0_IN);
-    ETH.setHostname(RackOTA.hostname().c_str());
+    ETH.setHostname(hostname().c_str());
     while (!ETH.linkUp() || ETH.localIP() == IPAddress()) {
         delay(250);
         Serial.print(".");
@@ -17,7 +22,7 @@ void rackNetBegin()
     Serial.printf("\nethernet up: %s\n", ETH.localIP().toString().c_str());
 }
 
-#elif defined(RACK_USE_WIFI)
+#elif defined(EASYOTA_USE_WIFI)
 #include <WiFi.h>
 
 static bool tryWifi(const String &ssid, const String &pass, uint32_t timeoutMs)
@@ -34,19 +39,19 @@ static bool tryWifi(const String &ssid, const String &pass, uint32_t timeoutMs)
     return false;
 }
 
-void rackNetBegin()
+void EasyOTAClass::beginNetwork()
 {
     WiFi.mode(WIFI_STA);
-    WiFi.setHostname(RackOTA.hostname().c_str());
+    WiFi.setHostname(hostname().c_str());
     /* GUI-configured credentials first; fall back to the compiled-in ones so
      * a typo saved via the web form can't strand the board */
-    String ssid = RackOTA.wifiSsid(RACK_WIFI_SSID);
-    String pass = RackOTA.wifiPass(RACK_WIFI_PASS);
+    String ssid = wifiSsid(EASYOTA_WIFI_SSID);
+    String pass = wifiPass(EASYOTA_WIFI_PASS);
     while (true) {
         if (tryWifi(ssid, pass, 20000)) break;
         Serial.printf("\n'%s' failed, trying compiled-in '%s'\n",
-                      ssid.c_str(), RACK_WIFI_SSID);
-        if (tryWifi(RACK_WIFI_SSID, RACK_WIFI_PASS, 20000)) break;
+                      ssid.c_str(), EASYOTA_WIFI_SSID);
+        if (tryWifi(EASYOTA_WIFI_SSID, EASYOTA_WIFI_PASS, 20000)) break;
         Serial.println("\nstill no wifi, retrying both");
     }
     Serial.printf("\nwifi up: %s (%s)\n",
@@ -54,5 +59,5 @@ void rackNetBegin()
 }
 
 #else
-#error "define RACK_USE_WIFI or RACK_USE_ETH"
+#error "define EASYOTA_USE_WIFI or EASYOTA_USE_ETH"
 #endif

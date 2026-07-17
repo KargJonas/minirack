@@ -1,4 +1,4 @@
-// minirack boot sequence.  Render with:  dot -Tsvg boot-sequence.dot -o boot-sequence.svg
+// EasyOTA boot sequence.  Render with:  dot -Tsvg boot-sequence.dot -o boot-sequence.svg
 digraph boot {
     rankdir=TB;
     node  [shape=box, style=rounded, fontname="Helvetica", fontsize=11];
@@ -17,7 +17,7 @@ digraph boot {
 
     boot2 -> app [label="otadata selects a slot\n(blank otadata = ota_0,\nthe serial-flashed base image)"];
 
-    app -> valid [label="RackOTA.begin()\nmarks image valid"];
+    app -> valid [label="EasyOTA.begin()\nmarks image valid"];
     app -> reset [style=dashed, color=red, fontcolor=red,
                   label="crash before begin():\nbootloader marks slot aborted,\nboots the other slot"];
 

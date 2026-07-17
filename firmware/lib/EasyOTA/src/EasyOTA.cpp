@@ -1,4 +1,4 @@
-#include "RackOTA.h"
+#include "EasyOTA.h"
 #include <ESPAsyncWebServer.h>
 #include <Update.h>
 #include <Preferences.h>
@@ -13,7 +13,7 @@
 #include "esp_core_dump.h"
 #endif
 
-RackOTAClass RackOTA;
+EasyOTAClass EasyOTA;
 
 /* ------------------------------------------------------------------ */
 /* Safeguards. A/B rollback only covers images that crash before        */
@@ -32,8 +32,8 @@ RackOTAClass RackOTA;
 #define GUARD_CRASH_LIMIT 3
 #define GUARD_STABLE_MS   (5 * 60 * 1000)
 #define WD_PROBE_MS       15000
-#ifndef RACKOTA_WD_FAIL_MS
-#define RACKOTA_WD_FAIL_MS (5 * 60 * 1000)
+#ifndef EASYOTA_WD_FAIL_MS
+#define EASYOTA_WD_FAIL_MS (5 * 60 * 1000)
 #endif
 
 RTC_NOINIT_ATTR static uint32_t guardMagic;
@@ -42,7 +42,7 @@ RTC_NOINIT_ATTR static uint32_t guardWdStage;
 
 /* Global-constructor time, i.e. before setup() - so a validated image
  * that crashes even in setup() still gets counted and escaped from. */
-RackOTAClass::RackOTAClass()
+EasyOTAClass::EasyOTAClass()
 {
     if (guardMagic != GUARD_MAGIC) { /* power-on: RTC RAM is garbage */
         guardMagic = GUARD_MAGIC;
@@ -54,10 +54,10 @@ RackOTAClass::RackOTAClass()
         r == ESP_RST_TASK_WDT || r == ESP_RST_WDT) {
         if (++guardCrashes >= GUARD_CRASH_LIMIT) {
             guardCrashes = 0; /* don't re-fire every boot if rollback is impossible */
-            esp_rom_printf("[RackOTA] %d crash resets in a row, rolling back\n",
+            esp_rom_printf("[EasyOTA] %d crash resets in a row, rolling back\n",
                            GUARD_CRASH_LIMIT);
             esp_ota_mark_app_invalid_rollback_and_reboot(); /* no return on success */
-            esp_rom_printf("[RackOTA] rollback impossible (no valid other slot)\n");
+            esp_rom_printf("[EasyOTA] rollback impossible (no valid other slot)\n");
         }
     }
 }
@@ -99,12 +99,12 @@ static bool probeSelf(uint16_t port)
     return ok;
 }
 
-void RackOTAClass::wdEntry(void *self)
+void EasyOTAClass::wdEntry(void *self)
 {
-    ((RackOTAClass *)self)->watchdogTask();
+    ((EasyOTAClass *)self)->watchdogTask();
 }
 
-void RackOTAClass::watchdogTask()
+void EasyOTAClass::watchdogTask()
 {
     uint32_t firstFail = 0;
     for (;;) {
@@ -115,13 +115,13 @@ void RackOTAClass::watchdogTask()
             continue;
         }
         if (!firstFail) firstFail = millis();
-        if (millis() - firstFail < RACKOTA_WD_FAIL_MS) continue;
+        if (millis() - firstFail < EASYOTA_WD_FAIL_MS) continue;
         if (Update.isRunning()) continue; /* never yank the rug mid-upload */
         if (guardWdStage == 0) {
             guardWdStage = 1;
-            Serial.println("[RackOTA] watchdog: server unreachable, rebooting");
+            Serial.println("[EasyOTA] watchdog: server unreachable, rebooting");
         } else {
-            Serial.println("[RackOTA] watchdog: unreachable across a reboot, rolling back");
+            Serial.println("[EasyOTA] watchdog: unreachable across a reboot, rolling back");
             esp_ota_mark_app_invalid_rollback_and_reboot();
             /* only reached if there is no valid other slot: reboot and retry */
         }
@@ -133,7 +133,7 @@ void RackOTAClass::watchdogTask()
 /* The Arduino core auto-validates a pending image in initArduino() -- before
  * setup() runs -- which would defeat rollback for apps that crash in setup().
  * This override (of the core's weak symbol) defers validation until
- * RackOTA.begin() is reached. */
+ * EasyOTA.begin() is reached. */
 extern "C" bool verifyRollbackLater() { return true; }
 
 static const char *otaStateName(const esp_partition_t *part)
@@ -305,10 +305,10 @@ static String jsonEscape(String s)
     return s;
 }
 
-String RackOTAClass::configValue(const char *key, const char *def)
+String EasyOTAClass::configValue(const char *key, const char *def)
 {
     Preferences prefs;
-    if (!prefs.begin("rackota", true)) return String(def); /* namespace not created yet */
+    if (!prefs.begin("easyota", true)) return String(def); /* namespace not created yet */
     String v = prefs.isKey(key) ? prefs.getString(key, def) : String(def);
     prefs.end();
     return v;
@@ -337,7 +337,7 @@ public:
     }
 };
 
-void RackOTAClass::begin(const char *appInfo, uint16_t port)
+void EasyOTAClass::begin(const char *appInfo, uint16_t port)
 {
     /* We survived until here: keep this image across reboots. */
     esp_ota_mark_app_valid_cancel_rollback();
@@ -369,10 +369,10 @@ void RackOTAClass::begin(const char *appInfo, uint16_t port)
     });
     _server->begin();
 
-    xTaskCreate(wdEntry, "rackota_wd", 4096, this, 5, NULL);
+    xTaskCreate(wdEntry, "easyota_wd", 4096, this, 5, NULL);
 }
 
-void RackOTAClass::handle()
+void EasyOTAClass::handle()
 {
     /* survived long enough: a later crash streak counts from zero */
     if (!_stableMarked && millis() > GUARD_STABLE_MS) {
@@ -385,7 +385,7 @@ void RackOTAClass::handle()
     }
 }
 
-void RackOTAClass::scheduleReboot()
+void EasyOTAClass::scheduleReboot()
 {
     _rebootAt = millis() + 750; /* let the response drain first */
     _rebootPending = true;
@@ -403,7 +403,7 @@ static bool wantsHtml(AsyncWebServerRequest *req)
            req->getHeader("Accept")->value().indexOf("text/html") >= 0;
 }
 
-void RackOTAClass::sendActionPage(AsyncWebServerRequest *req, const String &msg)
+void EasyOTAClass::sendActionPage(AsyncWebServerRequest *req, const String &msg)
 {
     if (!wantsHtml(req)) {
         req->send(200, "text/plain", msg + "\n");
@@ -480,7 +480,7 @@ Last reset: %LAST_RESET%
 
 /* Substitution is a single streaming pass over the template; returned values
  * are never re-scanned, so a stored "%TOKEN%" in hostname/ssid is inert. */
-String RackOTAClass::rootToken(const String &var)
+String EasyOTAClass::rootToken(const String &var)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
 
@@ -544,7 +544,7 @@ String RackOTAClass::rootToken(const String &var)
     return String();
 }
 
-void RackOTAClass::handleRoot(AsyncWebServerRequest *req)
+void EasyOTAClass::handleRoot(AsyncWebServerRequest *req)
 {
     req->send(200, "text/html", ROOT_TMPL,
               [this](const String &var) { return rootToken(var); });
@@ -554,7 +554,7 @@ void RackOTAClass::handleRoot(AsyncWebServerRequest *req)
 /* GET /status - everything, machine-readable     */
 /* ---------------------------------------------- */
 
-void RackOTAClass::handleStatus(AsyncWebServerRequest *req)
+void EasyOTAClass::handleStatus(AsyncWebServerRequest *req)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
 
@@ -635,10 +635,10 @@ void RackOTAClass::handleStatus(AsyncWebServerRequest *req)
 /* POST /config                                                        */
 /* ------------------------------------------------------------------ */
 
-void RackOTAClass::handleConfig(AsyncWebServerRequest *req)
+void EasyOTAClass::handleConfig(AsyncWebServerRequest *req)
 {
     Preferences prefs;
-    if (!prefs.begin("rackota", false)) {
+    if (!prefs.begin("easyota", false)) {
         req->send(500, "text/plain", "NVS open failed\n");
         return;
     }
@@ -666,23 +666,23 @@ void RackOTAClass::handleConfig(AsyncWebServerRequest *req)
 /* Reject an image that cannot fit the spare slot before burning any flash,
  * with a message that names both sizes. bodySize is exact for raw uploads;
  * for multipart it is the whole request, a close upper bound of the file. */
-bool RackOTAClass::updateTooBig(size_t bodySize, size_t slack)
+bool EasyOTAClass::updateTooBig(size_t bodySize, size_t slack)
 {
     const esp_partition_t *dst = esp_ota_get_next_update_partition(NULL);
     if (!dst || bodySize <= dst->size + slack) return false;
     _updateErr = "image (" + String(bodySize - slack) + " B) does not fit OTA slot " +
                  dst->label + " (" + String(dst->size) + " B)";
-    Serial.printf("[RackOTA] update rejected: %s\n", _updateErr.c_str());
+    Serial.printf("[EasyOTA] update rejected: %s\n", _updateErr.c_str());
     return true;
 }
 
-void RackOTAClass::handleUpdateData(AsyncWebServerRequest *req, uint8_t *data,
+void EasyOTAClass::handleUpdateData(AsyncWebServerRequest *req, uint8_t *data,
                                     size_t len, size_t index, size_t total)
 {
     if (index == 0) {
         _updateErr = "";
         if (updateTooBig(total, 0)) return;
-        Serial.println("[RackOTA] update started");
+        Serial.println("[EasyOTA] update started");
         if (Update.isRunning()) Update.abort(); /* client of a previous upload vanished */
         Update.begin(total ? total : UPDATE_SIZE_UNKNOWN, U_FLASH);
     }
@@ -690,18 +690,18 @@ void RackOTAClass::handleUpdateData(AsyncWebServerRequest *req, uint8_t *data,
     if (!Update.hasError()) Update.write(data, len);
     if (index + len == total) {
         Update.end(true);
-        Serial.printf("[RackOTA] update finished, %u bytes\n", (unsigned)total);
+        Serial.printf("[EasyOTA] update finished, %u bytes\n", (unsigned)total);
     }
 }
 
-void RackOTAClass::handleUpdateForm(AsyncWebServerRequest *req, const String &filename,
+void EasyOTAClass::handleUpdateForm(AsyncWebServerRequest *req, const String &filename,
                                     size_t index, uint8_t *data, size_t len, bool final)
 {
     if (index == 0) {
         _updateErr = "";
         /* multipart framing adds < 1 KiB on top of the file itself */
         if (updateTooBig(req->contentLength(), 4096)) return;
-        Serial.printf("[RackOTA] form update started: %s\n", filename.c_str());
+        Serial.printf("[EasyOTA] form update started: %s\n", filename.c_str());
         if (Update.isRunning()) Update.abort();
         Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
     }
@@ -709,11 +709,11 @@ void RackOTAClass::handleUpdateForm(AsyncWebServerRequest *req, const String &fi
     if (!Update.hasError()) Update.write(data, len);
     if (final) {
         Update.end(true);
-        Serial.printf("[RackOTA] form update finished, %u bytes\n", (unsigned)(index + len));
+        Serial.printf("[EasyOTA] form update finished, %u bytes\n", (unsigned)(index + len));
     }
 }
 
-void RackOTAClass::handleUpdateDone(AsyncWebServerRequest *req)
+void EasyOTAClass::handleUpdateDone(AsyncWebServerRequest *req)
 {
     if (_updateErr.length()) {
         req->send(400, "text/plain", "update failed: " + _updateErr + "\n");
@@ -732,7 +732,7 @@ void RackOTAClass::handleUpdateDone(AsyncWebServerRequest *req)
 
 /* ------------------------------------------------------------------ */
 
-void RackOTAClass::handleBoot(AsyncWebServerRequest *req)
+void EasyOTAClass::handleBoot(AsyncWebServerRequest *req)
 {
     /* query string (curl) or form body (the GUI's slot selector) */
     String part;

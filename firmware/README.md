@@ -1,7 +1,9 @@
-# minirack firmware
+# EasyOTA firmware
 
-Firmware for the rack-monitor board (WT32-ETH01). No USB/UART on the final
-hardware. Everything after the initial flash goes over ethernet via HTTP.
+Generic ESP32 firmware that stays updatable over the network: after the
+initial serial flash, everything goes over ethernet (or WiFi) via HTTP — no
+USB/UART needed. Built for the WT32-ETH01, but nothing here is tied to any
+particular application; drop your own sketch on top and it stays flashable.
 
 ## Architecture
 
@@ -13,38 +15,38 @@ flash (4MB)                       partitions_4mb.csv (shared by all builds)
 └── coredump 192K   <- crash dump of the most recent panic (diagnostics)
 ```
 
-Everything is a plain Arduino sketch built on the same two libraries — there
-is exactly one implementation of the HTTP API, the OTA logic, and the network
+Everything is a plain Arduino sketch built on the same library — there is
+exactly one implementation of the HTTP API, the OTA logic, and the network
 bringup:
 
-- **`lib/RackOTA`**: all HTTP endpoints (status, upload, config, slot boot,
-  rollback diagnostics) plus the rollback handshake and the safeguards
+- **`lib/EasyOTA`**: the whole framework in one library. Network bringup
+  (`EasyOTA.beginNetwork()`, ethernet or WiFi via `-DEASYOTA_USE_ETH` /
+  `-DEASYOTA_USE_WIFI`) plus all HTTP endpoints (status, upload, config, slot
+  boot, rollback diagnostics), the rollback handshake, and the safeguards
   described below. Built on
   [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer):
   requests are served from the async_tcp task, so a busy `loop()` can't
-  stall HTTP; `RackOTA.handle()` only runs deferred reboots.
-- **`lib/RackNet`**: the one network bringup (`rackNetBegin()`), ethernet or
-  WiFi via `-DRACK_USE_ETH` / `-DRACK_USE_WIFI`.
-- **`base/`**: the minimal image (network + RackOTA, nothing else),
+  stall HTTP; `EasyOTA.handle()` only runs deferred reboots.
+- **`base/`**: the minimal image (EasyOTA and nothing else),
   serial-flashed into `ota_0` when a board is first commissioned so it is
   reachable over HTTP from day one. Afterwards it's an ordinary slot
   occupant — later uploads overwrite it.
 - **`app/`**: demo app / template. Any Arduino firmware works, as long as it
-  includes RackOTA so it stays updatable.
+  includes EasyOTA so it stays updatable.
 
 ### Safe flashing
 
 The bootloader is built with app rollback (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`;
 the prebuilt arduino-esp32 bootloader ships with it enabled). A freshly
-uploaded image boots in "pending verify" state; `RackOTA.begin()` marks it
+uploaded image boots in "pending verify" state; `EasyOTA.begin()` marks it
 valid. If it crashes anywhere before that, the next reset rolls back to the
 previous image in the other slot.
 
-RackOTA overrides the Arduino core's weak `verifyRollbackLater()`. Otherwise,
+EasyOTA overrides the Arduino core's weak `verifyRollbackLater()`. Otherwise,
 the core would auto-validate the image before `setup()` even runs, and a
 crash in `setup()` would boot-loop forever instead of rolling back.
 
-**Always include RackOTA.** An app without it validates itself at boot,
+**Always include EasyOTA.** An app without it validates itself at boot,
 serves no endpoints, and can only be replaced via serial.
 
 ### Safeguards: escaping bad-but-VALIDATED images
@@ -52,7 +54,7 @@ serves no endpoints, and can only be replaced via serial.
 Bootloader rollback only covers images that crash *before* validating. An
 image that validates and *then* turns bad (crash loop after an hour, heap
 exhaustion, wedged server task) would be booted forever and lock us out of a
-board with no UART. RackOTA adds two escape hatches, both landing on the
+board with no UART. EasyOTA adds two escape hatches, both landing on the
 previous image in the other slot:
 
 - **Crash-loop guard** (runs before `setup()`): 3 crash resets (panic/WDT)
@@ -69,7 +71,7 @@ Drills (flash, watch it happen, board comes back on the previous image):
 `pio run` with `-DCRASH_TEST` (crash before validation → plain rollback),
 `-DCRASH_LOOP_TEST` (validate, then crash-loop → crash guard),
 `-DWD_TEST` (validate, then kill the network → watchdog escalation; add
-`-DRACKOTA_WD_FAIL_MS=60000` to shorten the drill).
+`-DEASYOTA_WD_FAIL_MS=60000` to shorten the drill).
 
 ### Rollback diagnostics
 
@@ -120,10 +122,10 @@ curl -H 'Content-Type: application/octet-stream' \
                                                       # form default would be refused)
 curl -X POST "http://<ip>/boot?part=ota_0"            # or ota_1
 curl -X POST http://<ip>/reboot
-curl -d "hostname=rack1&ssid=&pass=" http://<ip>/config  # empty = default/unchanged
+curl -d "hostname=device1&ssid=&pass=" http://<ip>/config  # empty = default/unchanged
 ```
 
-The device requests the configured hostname (default `minirack`) via DHCP.
+The device requests the configured hostname (default `esp32-easyota`) via DHCP.
 
 ## Base image: build + initial serial flash (once per board)
 

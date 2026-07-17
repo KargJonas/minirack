@@ -1,8 +1,8 @@
-# Shared partition table for minirack boards (4MB flash). Plain A/B:
-# the serial flash puts the base image (RackOTA only) into ota_0; every HTTP
+# Shared partition table for all builds (4MB flash). Plain A/B:
+# the serial flash puts the base image (EasyOTA only) into ota_0; every HTTP
 # upload goes to the slot not currently running. A bad upload rolls back to
-# the previous image; bad-but-validated images are handled by RackOTA's
-# crash-loop guard and reachability watchdog (see lib/RackOTA).
+# the previous image; bad-but-validated images are handled by EasyOTA's
+# crash-loop guard and reachability watchdog (see lib/EasyOTA).
 # coredump holds the crash dump of the most recent panic, reported via
 # /status for rollback diagnostics.
 # Name,     Type, SubType,  Offset,   Size

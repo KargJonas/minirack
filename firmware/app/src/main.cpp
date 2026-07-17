@@ -1,5 +1,5 @@
 /*
- * minirack clock test. This outputs hardware clocks (LEDC, 50% duty) on the pins
+ * Clock-test demo app. This outputs hardware clocks (LEDC, 50% duty) on the pins
  * currently wired to the logic analyzer:
  *
  *   LA ch1  GPIO0   1 kHz    (strapping pin: parked high before OTA reboots)
@@ -7,11 +7,10 @@
  *   LA ch3  GPIO5   100 kHz
  *   LA ch4  GPIO2   1 MHz
  *
- * Stays OTA-updatable via RackOTA (curl --data-binary @firmware.bin .../update).
+ * Stays OTA-updatable via EasyOTA (curl --data-binary @firmware.bin .../update).
  */
 #include <Arduino.h>
-#include <RackOTA.h>
-#include <RackNet.h>
+#include <EasyOTA.h>
 #ifdef WD_TEST
 #include <WiFi.h>
 #endif
@@ -34,14 +33,14 @@ void setup()
     Serial.println("\n" APP_VERSION);
 
 #ifdef CRASH_TEST
-    /* rollback drill: die before RackOTA.begin() can validate the image */
+    /* rollback drill: die before EasyOTA.begin() can validate the image */
     Serial.println("CRASH_TEST: aborting before validation");
     delay(200);
     abort();
 #endif
 
-    rackNetBegin();
-    RackOTA.begin(APP_VERSION);
+    EasyOTA.beginNetwork();
+    EasyOTA.begin(APP_VERSION);
 
 #ifdef WD_TEST
     /* watchdog drill: a validated image whose server is unreachable - the
@@ -50,7 +49,7 @@ void setup()
     WiFi.mode(WIFI_OFF);
 #endif
     /* GPIO0 straps to download mode if sampled low during a reboot */
-    RackOTA.onReboot([]() {
+    EasyOTA.onReboot([]() {
         ledcDetachPin(0);
         pinMode(0, OUTPUT);
         digitalWrite(0, HIGH);
@@ -65,7 +64,7 @@ void setup()
 
 void loop()
 {
-    RackOTA.handle();
+    EasyOTA.handle();
 
 #ifdef CRASH_LOOP_TEST
     /* safeguard drill: a VALIDATED image that crash-loops - the crash-loop
