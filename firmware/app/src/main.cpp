@@ -7,7 +7,7 @@
  *   LA ch3  GPIO5   100 kHz
  *   LA ch4  GPIO2   1 MHz
  *
- * Stays OTA-updatable via EasyOTA (curl --data-binary @firmware.bin .../update).
+ * Stays OTA-updatable via EasyOTA (curl --data-binary @firmware.bin .../easy-ota/update).
  */
 #include <Arduino.h>
 #include <EasyOTA.h>

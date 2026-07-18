@@ -125,7 +125,7 @@ fi
 # Every ESP32 app image embeds esp_app_desc_t at file offset 32 (after the
 # 24-byte image header and the first 8-byte segment header): magic 0xABCD5432,
 # and the toolchain's per-build ELF SHA-256 at struct offset 144 -> file 176.
-# The device reports the same bytes in /status as "elf_sha256".
+# The device reports the same bytes in /easy-ota/status as "elf_sha256".
 if [ "$(xxd -p -s 32 -l 4 "$bin")" != "3254cdab" ]; then
     echo "error: $bin does not look like an ESP32 app image" >&2
     exit 3
@@ -136,7 +136,8 @@ get()   { curl -fsS -m 3 "http://$host/$1" 2>/dev/null; }
 field() { grep -o "\"$2\":\"[^\"]*\"" <<<"$1" | head -1 | cut -d'"' -f4; }
 
 # Explain *why* the upload was rolled back, from the survivor's /status
-# diagnostics: the reset reason survives the rollback reboot, the rejected
+# diagnostics (all endpoints live under /easy-ota): the reset reason survives
+# the rollback reboot, the rejected
 # image stays in its slot marked "aborted", and the panic handler left a
 # core dump (task, PC, backtrace) in the coredump partition.
 diag() {
@@ -160,21 +161,21 @@ diag() {
     fi
 }
 
-echo "uploading $(stat -c %s "$bin") bytes (${want_sha:0:12}...) to http://$host/update"
+echo "uploading $(stat -c %s "$bin") bytes (${want_sha:0:12}...) to http://$host/easy-ota/update"
 # explicit content type: curl's default (x-www-form-urlencoded) would make the
 # async server parse the image as a form. The device flashes each chunk
 # before ACKing more (TCP backpressure), so curl's upload bar tracks the
 # actual flash progress - but curl mutes the bar if the response body goes
 # to the terminal, hence the capture-then-echo.
 resp=$(curl -f --progress-bar -H 'Content-Type: application/octet-stream' \
-       --data-binary @"$bin" "http://$host/update")
+       --data-binary @"$bin" "http://$host/easy-ota/update")
 echo "$resp"
 
 start=$SECONDS
 printf 'waiting for the board to come back ' >&2
 sleep 3
 while (( SECONDS - start < timeout )); do
-    if status=$(get status); then
+    if status=$(get easy-ota/status); then
         elapsed=$((SECONDS - start))
         sha=$(field "$status" elf_sha256)
         part=$(field "$status" partition)
