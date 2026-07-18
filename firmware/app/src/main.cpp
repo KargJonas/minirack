@@ -11,6 +11,7 @@
  */
 #include <Arduino.h>
 #include <EasyOTA.h>
+#include <ESPAsyncWebServer.h> /* for app routes on EasyOTA.server() */
 #ifdef WD_TEST
 #include <WiFi.h>
 #endif
@@ -32,14 +33,16 @@ void setup()
     Serial.begin(115200);
     Serial.println("\n" APP_VERSION);
 
+    EasyOTA.beginNetwork();
+
 #ifdef CRASH_TEST
-    /* rollback drill: die before EasyOTA.begin() can validate the image */
+    /* rollback drill: die before EasyOTA.begin() can validate the image -
+     * after network bringup, so the crash timeline has something to tell */
     Serial.println("CRASH_TEST: aborting before validation");
     delay(200);
     abort();
 #endif
 
-    EasyOTA.beginNetwork();
     EasyOTA.begin(APP_VERSION);
 
 #ifdef WD_TEST
@@ -60,6 +63,15 @@ void setup()
     startClock(4, 5, 100000, 8);   /* 100 kHz */
     startClock(6, 2, 1000000, 4);  /* 1 MHz   */
     Serial.println("clocks running: GPIO0=1k GPIO4=10k GPIO5=100k GPIO2=1M");
+
+    /* App-specific route on the shared server. Registered after
+     * EasyOTA.begin(), so it can never shadow the EasyOTA endpoints
+     * (handlers match in registration order). */
+    EasyOTA.server()->on("/clocks", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "application/json",
+                  "{\"gpio0\":1000,\"gpio4\":10000,\"gpio5\":100000,"
+                  "\"gpio2\":1000000}\n");
+    });
 }
 
 void loop()

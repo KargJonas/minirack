@@ -75,7 +75,7 @@ Drills (flash, watch it happen, board comes back on the previous image):
 
 ### Rollback diagnostics
 
-A rolled-back flash is not a black box. Three artifacts survive the rollback
+A rolled-back flash is not a black box. Four artifacts survive the rollback
 and are reported in `/status` (and on the GUI):
 
 - `last_reset` — the crash's reset reason lives in RTC memory: `panic`,
@@ -91,6 +91,17 @@ and are reported in `/status` (and on the GUI):
   xtensa-esp32-elf-addr2line -e .pio/build/<env>/firmware.elf <crash_bt addresses>
   ```
 
+- `crash_timeline` — the crashed boot's event sequence with
+  time-since-boot stamps, e.g.
+  `boot@2ms net-begin@66ms net-up@1430ms last-alive@1430ms`: how far
+  bringup got and when, plus a `last-alive` heartbeat (bumped by every
+  `loop()`) bracketing the crash moment. Recorded in RTC memory, no NTP
+  involved. The running boot's sequence is always in `/status` as
+  `timeline` (spot slow bringup); apps add their own milestones with
+  `EasyOTA.event("sensors-up")` (built-ins: `boot`, `net-begin`,
+  `net-up`, `validated`, `http-up`, `mdns-up`, `update-start`,
+  `update-done`, `reboot-sched`).
+
 `flash.sh` prints all of this automatically when an upload gets rolled back.
 `/status` also reports the safeguard state (`guard.crash_resets`,
 `guard.wd_stage`).
@@ -98,8 +109,19 @@ and are reported in `/status` (and on the GUI):
 ### Verified flashing: flash.sh
 
 ```sh
-./flash.sh <host> firmware.bin   # exit 0: uploaded build verifiably running
+app/flash.sh [host] [firmware.bin]   # exit 0: uploaded build verifiably running
 ```
+
+Without a host it discovers boards via mDNS and always asks which to
+flash — also with a single candidate, so a board that silently dropped
+off the network can't redirect an upload to the wrong survivor.
+Without an explicit `.bin` it asks which environment to build
+(enter = `default_envs`), runs `pio run -e <env>` itself (offering to
+re-flash the existing image instead, if one is present), and uploads
+that image. The env choice is always explicit so a wt32-eth01 image
+can't silently end up on the lolin32 dev board (it would
+brick-and-roll-back: the ETH bringup watchdog-resets on a board with no
+PHY). So a plain `flash.sh` builds, discovers, and flashes.
 
 Uploads, waits for the reboot, then proves *the exact build you uploaded* is
 what runs: every ESP32 image embeds a unique per-build SHA-256 (at file
@@ -118,6 +140,10 @@ curl http://<ip>/status                               # one JSON object with eve
 curl -H 'Content-Type: application/octet-stream' \
      --data-binary @firmware.bin http://<ip>/update   # flash other slot + boot it
                                                       # (rejects images > slot size;
+                                                      # 409 while another upload is
+                                                      # actively running - but a stale
+                                                      # session whose client vanished
+                                                      # is taken over after 10 s;
                                                       # content type required - curl's
                                                       # form default would be refused)
 curl -X POST "http://<ip>/boot?part=ota_0"            # or ota_1
@@ -125,7 +151,45 @@ curl -X POST http://<ip>/reboot
 curl -d "hostname=device1&ssid=&pass=" http://<ip>/config  # empty = default/unchanged
 ```
 
-The device requests the configured hostname (default `esp32-easyota`) via DHCP.
+### Adding your own endpoints
+
+The app shares EasyOTA's server instead of running its own:
+
+```cpp
+#include <ESPAsyncWebServer.h>
+
+void setup() {
+    EasyOTA.beginNetwork();
+    EasyOTA.begin("my-app v1");
+    EasyOTA.server()->on("/clocks", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "application/json", "{\"gpio0\":1000}\n");
+    });
+}
+```
+
+This is safe by construction: handlers match in registration order and
+`begin()` registers all EasyOTA routes first, so app routes (even greedy
+catch-alls) can never shadow `/update` & co. It is also no less robust
+than a second server — *all* ESPAsyncWebServer instances are serviced by
+the same `async_tcp` task, so a second port would share every failure
+mode anyway — and the reachability watchdog guards the shared server:
+if app code renders it unusable, the board reboots and, if that doesn't
+cure it, rolls back.
+
+The genuinely isolated alternative is a server from a *different* stack
+on its own port (e.g. the synchronous `WebServer.h` driven from
+`loop()`): if that one wedges, EasyOTA keeps serving from `async_tcp`
+and OTA remains the rescue path.
+
+The device requests the configured hostname via DHCP; the default is
+`esp32-easyota-<xxxxxx>` with the last three bytes of the board's
+factory MAC, so unconfigured boards get distinct names out of the box.
+It also advertises the mDNS service `_easyota._tcp` (TXT: app info, ELF
+SHA prefix, running partition) for IP-less discovery:
+
+```sh
+avahi-browse -rt _easyota._tcp
+```
 
 ## Base image: build + initial serial flash (once per board)
 
@@ -142,8 +206,7 @@ boots `ota_0`, where the base image lands) + the base image.
 
 ```sh
 cd app
-pio run -e lolin32                # or -e wt32-eth01
-../flash.sh <ip> .pio/build/lolin32/firmware.bin
+./flash.sh                        # builds (asks which env), discovers, uploads
 ```
 
 ## Dev setup notes (LOLIN32)

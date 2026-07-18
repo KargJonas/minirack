@@ -1,0 +1,5 @@
+Script started on 2026-07-17 13:44:25+02:00 [COMMAND="curl -sS -f --progress-bar -T  -o /dev/null http://127.0.0.1:8199/update; echo curl-exit=$?" <not executed on terminal>]
+curl: (3) URL using bad/illegal format or missing URL
+curl-exit=3
+
+Script done on 2026-07-17 13:44:25+02:00 [COMMAND_EXIT_CODE="0"]

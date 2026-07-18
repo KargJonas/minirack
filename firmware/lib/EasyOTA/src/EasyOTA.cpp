@@ -1,5 +1,6 @@
 #include "EasyOTA.h"
 #include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
 #include <Update.h>
 #include <Preferences.h>
 #include "sdkconfig.h"
@@ -9,6 +10,7 @@
 #include "esp_netif.h"
 #include "esp_rom_sys.h"
 #include "lwip/sockets.h"
+#include <time.h>
 #if __has_include("esp_core_dump.h")
 #include "esp_core_dump.h"
 #endif
@@ -35,10 +37,43 @@ EasyOTAClass EasyOTA;
 #ifndef EASYOTA_WD_FAIL_MS
 #define EASYOTA_WD_FAIL_MS (5 * 60 * 1000)
 #endif
+#ifndef EASYOTA_NTP_SERVER
+#define EASYOTA_NTP_SERVER "pool.ntp.org"
+#endif
+/* epochs below this (Sep 2001) mean the clock still counts from 1970,
+ * i.e. was never NTP-synced since power-on */
+#define TIME_VALID_MIN 1000000000
 
 RTC_NOINIT_ATTR static uint32_t guardMagic;
 RTC_NOINIT_ATTR static uint32_t guardCrashes;
 RTC_NOINIT_ATTR static uint32_t guardWdStage;
+/* wall-clock stamp of the last crash, waiting to be persisted to NVS by the
+ * next begin() - which may run in the OTHER image after a rollback, hence
+ * the handoff through RTC memory */
+RTC_NOINIT_ATTR static uint32_t crashStampMagic;
+RTC_NOINIT_ATTR static uint32_t crashStampEpoch;
+
+/* Boot timeline: millis()-relative stamps of the lifecycle events of THIS
+ * boot (net up, server up, app events via EasyOTA.event()), kept in RTC
+ * memory so that after a crash the next boot - possibly the other image -
+ * can report how far the crashed boot got and when. bootlogHbMs is bumped
+ * by every handle() as a cheap "loop was still alive at" marker: the crash
+ * moment itself can't be stamped (the panic handler isn't ours), but the
+ * last heartbeat brackets it to within one loop iteration. */
+#define BOOTLOG_MAGIC 0x52474432 /* "RGD2" */
+#define BOOTLOG_MAX 16
+#define BOOTLOG_TAGLEN 15
+RTC_NOINIT_ATTR static uint32_t bootlogMagic;
+RTC_NOINIT_ATTR static uint32_t bootlogCount;
+RTC_NOINIT_ATTR static uint32_t bootlogHbMs;
+RTC_NOINIT_ATTR static struct {
+    uint32_t ms;
+    char tag[BOOTLOG_TAGLEN + 1];
+} bootlogEv[BOOTLOG_MAX];
+
+/* the crashed boot's serialized timeline, captured by the constructor
+ * before the live log is reset; persisted to NVS by begin() */
+static char crashTimeline[512];
 
 /* Global-constructor time, i.e. before setup() - so a validated image
  * that crashes even in setup() still gets counted and escaped from. */
@@ -48,10 +83,33 @@ EasyOTAClass::EasyOTAClass()
         guardMagic = GUARD_MAGIC;
         guardCrashes = 0;
         guardWdStage = 0;
+        crashStampMagic = 0;
+        bootlogMagic = 0;
     }
     esp_reset_reason_t r = esp_reset_reason();
     if (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
         r == ESP_RST_TASK_WDT || r == ESP_RST_WDT) {
+        /* system time lives in the RTC domain and keeps running across a
+         * panic reset, so "now" is within ~1 s of the moment of the crash;
+         * 0 records "crashed, but the clock was never synced" */
+        time_t now = time(NULL);
+        crashStampMagic = GUARD_MAGIC;
+        crashStampEpoch = now > TIME_VALID_MIN ? (uint32_t)now : 0;
+        /* keep the crashed boot's event sequence before the log restarts
+         * (no Strings here: global ctors of other units may not have run) */
+        if (bootlogMagic == BOOTLOG_MAGIC) {
+            /* -32: room for one entry, keeps off < sizeof so the size_t
+             * subtractions below can't underflow */
+            size_t off = 0;
+            for (uint32_t i = 0; i < bootlogCount && i < BOOTLOG_MAX &&
+                                 off < sizeof(crashTimeline) - 32; i++)
+                off += snprintf(crashTimeline + off, sizeof(crashTimeline) - off,
+                                "%s%s@%ums", off ? " " : "",
+                                bootlogEv[i].tag, (unsigned)bootlogEv[i].ms);
+            if (off < sizeof(crashTimeline) - 32)
+                snprintf(crashTimeline + off, sizeof(crashTimeline) - off,
+                         "%slast-alive@%ums", off ? " " : "", (unsigned)bootlogHbMs);
+        }
         if (++guardCrashes >= GUARD_CRASH_LIMIT) {
             guardCrashes = 0; /* don't re-fire every boot if rollback is impossible */
             esp_rom_printf("[EasyOTA] %d crash resets in a row, rolling back\n",
@@ -60,6 +118,34 @@ EasyOTAClass::EasyOTAClass()
             esp_rom_printf("[EasyOTA] rollback impossible (no valid other slot)\n");
         }
     }
+    /* fresh timeline for this boot */
+    bootlogMagic = BOOTLOG_MAGIC;
+    bootlogCount = 0;
+    bootlogHbMs = 0;
+    event("boot");
+}
+
+/* Record a named event at the current relative-to-boot time. The count is
+ * bumped last so a crash mid-call can't expose a half-written entry. */
+void EasyOTAClass::event(const char *tag)
+{
+    if (bootlogMagic == BOOTLOG_MAGIC && bootlogCount < BOOTLOG_MAX) {
+        bootlogEv[bootlogCount].ms = millis();
+        strlcpy(bootlogEv[bootlogCount].tag, tag, BOOTLOG_TAGLEN + 1);
+        bootlogCount++;
+    }
+    bootlogHbMs = millis();
+}
+
+/* The live timeline of this boot, "boot@2ms net-up@1204ms ..." */
+static String timelineNow()
+{
+    String t;
+    for (uint32_t i = 0; i < bootlogCount && i < BOOTLOG_MAX; i++) {
+        if (t.length()) t += " ";
+        t += String(bootlogEv[i].tag) + "@" + String(bootlogEv[i].ms) + "ms";
+    }
+    return t;
 }
 
 static bool haveIp()
@@ -163,6 +249,52 @@ static String runningSha()
     return sha256Hex(esp_ota_get_app_description()->app_elf_sha256);
 }
 
+static String hexAddr(uint32_t a)
+{
+    char buf[12];
+    snprintf(buf, sizeof(buf), "0x%08x", (unsigned)a);
+    return String(buf);
+}
+
+static String fmtUtc(uint32_t epoch)
+{
+    time_t t = epoch;
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    char buf[20];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    return String(buf) + " UTC";
+}
+
+static String fmtDuration(uint32_t s)
+{
+    if (s >= 86400) return String(s / 86400) + "d " + String(s % 86400 / 3600) + "h";
+    if (s >= 3600)  return String(s / 3600) + "h " + String(s % 3600 / 60) + "m";
+    if (s >= 60)    return String(s / 60) + "m " + String(s % 60) + "s";
+    return String(s) + "s";
+}
+
+/* Crash timestamp persisted by begin(); 0 = none recorded / clock was
+ * never synced when it happened. */
+static uint32_t crashEpochStored()
+{
+    Preferences prefs;
+    if (!prefs.begin("easyota", true)) return 0;
+    uint32_t v = prefs.getULong("crashtime", 0);
+    prefs.end();
+    return v;
+}
+
+/* The crashed boot's event timeline persisted by begin(); "" = none. */
+static String crashLogStored()
+{
+    Preferences prefs;
+    if (!prefs.begin("easyota", true)) return String();
+    String v = prefs.getString("crashlog", "");
+    prefs.end();
+    return v;
+}
+
 /* ------------------------------------------------------------------  */
 /* Rollback diagnostics. After the bootloader reverts a bad upload,    */
 /*  - the reset reason of the crash survives in RTC (panic/wdt/...)    */
@@ -189,15 +321,20 @@ static const char *resetReasonName()
     }
 }
 
+/* Xtensa EXCCAUSE values, phrased for humans; the CamelCase term in
+ * parentheses is what the IDF panic handler prints, i.e. the googleable one. */
 static const char *excCauseName(uint32_t cause)
 {
     switch (cause) {
-    case 0:  return "illegal-instruction";
-    case 3:  return "load-store-error";
-    case 6:  return "divide-by-zero";
-    case 9:  return "unaligned-access";
-    case 28: return "load-prohibited";
-    case 29: return "store-prohibited";
+    case 0:  return "illegal instruction (corrupt code or wild jump)";
+    case 2:  return "instruction fetch error";
+    case 3:  return "load/store to an address the bus rejects (LoadStoreError)";
+    case 6:  return "integer divide by zero";
+    case 8:  return "privileged instruction";
+    case 9:  return "unaligned load/store";
+    case 20: return "jump to an invalid address (InstrFetchProhibited)";
+    case 28: return "read from an invalid address, e.g. NULL deref (LoadProhibited)";
+    case 29: return "write to an invalid address, e.g. NULL deref (StoreProhibited)";
     default: return "";
     }
 }
@@ -226,8 +363,11 @@ static bool abortedSlot(String &slot, String &sha)
 
 struct CrashInfo {
     bool valid = false;
-    String task, pc, bt, elf;
+    String task, pc, elf; /* elf: PREFIX of the crashing build's sha256 */
     uint32_t cause = 0, vaddr = 0;
+    uint32_t bt[16] = { 0 };
+    uint32_t depth = 0;
+    bool corrupted = false;
 };
 
 /* Summary of the core dump the panic handler left in the coredump
@@ -243,20 +383,29 @@ static CrashInfo crashInfo()
     char task[sizeof(sum.exc_task) + 1] = { 0 };
     memcpy(task, sum.exc_task, sizeof(sum.exc_task));
     c.task = task;
-    char buf[12];
-    snprintf(buf, sizeof(buf), "0x%08x", (unsigned)sum.exc_pc);
-    c.pc = buf;
-    for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 16; i++) {
-        snprintf(buf, sizeof(buf), "0x%08x", (unsigned)sum.exc_bt_info.bt[i]);
-        if (c.bt.length()) c.bt += " ";
-        c.bt += buf;
-    }
-    if (sum.exc_bt_info.corrupted) c.bt += " (corrupted)";
+    c.pc = hexAddr(sum.exc_pc);
+    c.depth = sum.exc_bt_info.depth;
+    if (c.depth > 16) c.depth = 16;
+    for (uint32_t i = 0; i < c.depth; i++)
+        c.bt[i] = sum.exc_bt_info.bt[i];
+    c.corrupted = sum.exc_bt_info.corrupted;
     c.elf = (const char *)sum.app_elf_sha256;
     c.cause = sum.ex_info.exc_cause;
     c.vaddr = sum.ex_info.exc_vaddr;
 #endif
     return c;
+}
+
+/* Single-line form for /status: flash.sh greps crash_bt as one string. */
+static String backtraceOneLine(const CrashInfo &c)
+{
+    String bt;
+    for (uint32_t i = 0; i < c.depth; i++) {
+        if (bt.length()) bt += " ";
+        bt += hexAddr(c.bt[i]);
+    }
+    if (c.corrupted) bt += " (corrupted)";
+    return bt;
 }
 
 static String slotList()
@@ -305,6 +454,23 @@ static String jsonEscape(String s)
     return s;
 }
 
+String EasyOTAClass::hostname(const char *def)
+{
+    /* Default: unique per board via the factory-burned base MAC. Only the
+     * last three bytes vary (the first three are Espressif's OUI). */
+    static char dh[24];
+    if (!def) {
+        if (!dh[0]) {
+            uint8_t mac[6];
+            esp_efuse_mac_get_default(mac);
+            snprintf(dh, sizeof dh, "esp32-easyota-%02x%02x%02x",
+                     mac[3], mac[4], mac[5]);
+        }
+        def = dh;
+    }
+    return configValue("hostname", def);
+}
+
 String EasyOTAClass::configValue(const char *key, const char *def)
 {
     Preferences prefs;
@@ -341,6 +507,28 @@ void EasyOTAClass::begin(const char *appInfo, uint16_t port)
 {
     /* We survived until here: keep this image across reboots. */
     esp_ota_mark_app_valid_cancel_rollback();
+    event("validated");
+
+    /* wall clock via SNTP (retries in the background until the net answers);
+     * feeds the status page clock and the crash timestamps */
+    configTime(0, 0, EASYOTA_NTP_SERVER);
+
+    /* a crash stamp left by the constructor - possibly by the image that
+     * crashed, before a rollback - moves to NVS here so it survives
+     * power-off, like the core dump it belongs to */
+    if (crashStampMagic == GUARD_MAGIC) {
+        crashStampMagic = 0;
+        Preferences prefs;
+        if (prefs.begin("easyota", false)) {
+            prefs.putULong("crashtime", crashStampEpoch);
+            /* the timeline the constructor captured belongs to the same
+             * crash; empty (e.g. RTC layout of the crashed build differs)
+             * removes the stale one rather than mislabeling it */
+            crashTimeline[0] ? (void)prefs.putString("crashlog", crashTimeline)
+                             : (void)prefs.remove("crashlog");
+            prefs.end();
+        }
+    }
 
     _info = appInfo;
     _port = port;
@@ -368,12 +556,30 @@ void EasyOTAClass::begin(const char *appInfo, uint16_t port)
         scheduleReboot();
     });
     _server->begin();
+    event("http-up");
+
+    /* Advertise _easyota._tcp via mDNS so tools can discover boards without
+     * knowing IP or hostname (flash.sh does; or:
+     * avahi-browse -rt _easyota._tcp). TXT records identify the board when
+     * several answer. */
+    if (MDNS.begin(hostname().c_str())) {
+        MDNS.addService("easyota", "tcp", port);
+        MDNS.addServiceTxt("easyota", "tcp", "info", _info.c_str());
+        MDNS.addServiceTxt("easyota", "tcp", "sha",
+                           runningSha().substring(0, 12).c_str());
+        MDNS.addServiceTxt("easyota", "tcp", "part",
+                           esp_ota_get_running_partition()->label);
+        event("mdns-up");
+    } else {
+        Serial.println("easyota: mDNS failed to start");
+    }
 
     xTaskCreate(wdEntry, "easyota_wd", 4096, this, 5, NULL);
 }
 
 void EasyOTAClass::handle()
 {
+    bootlogHbMs = millis(); /* the loop was alive at this uptime */
     /* survived long enough: a later crash streak counts from zero */
     if (!_stableMarked && millis() > GUARD_STABLE_MS) {
         _stableMarked = true;
@@ -387,6 +593,7 @@ void EasyOTAClass::handle()
 
 void EasyOTAClass::scheduleReboot()
 {
+    event("reboot-sched");
     _rebootAt = millis() + 750; /* let the response drain first */
     _rebootPending = true;
 }
@@ -429,22 +636,63 @@ static const char ROOT_TMPL[] PROGMEM = R"html(<!DOCTYPE html>
     <body>
         <h1>%HOST%</h1>
         <pre>
-App:        %INFO%
-SHA-256:    %SHA%
-Partition:  %PART%
-Slots:      %SLOTS%
-Uptime:     %UPTIME% s
-Heap:       %HEAP_FREE% KiB free of %HEAP_SIZE% KiB (%HEAP_PCT% used; min. ever %HEAP_MIN%, largest block %HEAP_BLOCK%)
-Flash:      app uses %FLASH_USED% KiB of %FLASH_SLOT% KiB slot (%FLASH_PCT% used)
-Tasks:      %TASKS% (loop stack headroom %STACK% B)
-Last reset: %LAST_RESET%
+App:                    %INFO%
+SHA-256:                %SHA%
+Partition:              %PART%
+Slots:                  %SLOTS%
+Uptime:                 %UPTIME% s
+Timeline:               %TIMELINE%
+Clock:                  %CLOCK%
+Heap:                   %HEAP_FREE% KiB free of %HEAP_SIZE% KiB (%HEAP_PCT% used; min. ever %HEAP_MIN%, largest block %HEAP_BLOCK%)
+Flash:                  app uses %FLASH_USED% KiB of %FLASH_SLOT% KiB slot (%FLASH_PCT% used)
+Tasks:                  %TASKS% (loop stack headroom %STACK% B)
+Reason for last reset:  %LAST_RESET%
 %DIAG%
         </pre>
 
         <h2>Upload Firmware</h2>
-        <form method='POST' action='/update-form' enctype='multipart/form-data'>
+        <form method='POST' action='/update-form' enctype='multipart/form-data' id='fwform'>
             <input type='file' name='fw'> <input type='submit' value='Flash'>
         </form>
+        <p id='fwprog' style='display:none'>
+            <progress id='fwbar' max='1000' value='0'></progress> <span id='fwpct'></span>
+        </p>
+        <script>
+        /* XHR instead of a plain submit, only to render upload progress: the
+           device flashes each chunk before ACKing more data (TCP
+           backpressure), so sent bytes track the actual flash progress.
+           Without JS the form still submits normally, just without a bar.
+           NOTE: no literal percent signs in this template - they would pair
+           with the substitution placeholders. */
+        document.getElementById('fwform').addEventListener('submit', function(ev) {
+            if (!this.fw.files.length) return; /* let the plain submit 400 */
+            ev.preventDefault();
+            var x = new XMLHttpRequest();
+            var bar = document.getElementById('fwbar');
+            var pct = document.getElementById('fwpct');
+            x.open('POST', '/update-form');
+            x.setRequestHeader('Accept', 'text/html'); /* want the action page */
+            x.upload.onprogress = function(e) {
+                if (!e.lengthComputable) return;
+                document.getElementById('fwprog').style.display = '';
+                bar.value = Math.round(1000 * e.loaded / e.total);
+                pct.textContent = Math.round(e.loaded / 1024) + ' / ' +
+                                  Math.round(e.total / 1024) + ' KiB';
+            };
+            /* response is the usual poll-until-back action page (or an
+               error page): hand the document over to it either way */
+            x.onload = function() {
+                document.open();
+                document.write(x.responseText);
+                document.close();
+            };
+            x.onerror = function() {
+                document.getElementById('fwprog').style.display = '';
+                pct.textContent = 'upload failed';
+            };
+            x.send(new FormData(this));
+        });
+        </script>
         <p>
             This board keeps two application partitions: the running image and a spare.<br>
             Uploading firmware writes the spare and reboots into it.<br>
@@ -491,6 +739,12 @@ String EasyOTAClass::rootToken(const String &var)
     if (var == "PART")       return running ? running->label : "?";
     if (var == "SLOTS")      return slotList();
     if (var == "UPTIME")     return String(millis() / 1000);
+    if (var == "TIMELINE")   return tmplEscape(timelineNow());
+    if (var == "CLOCK") {
+        time_t now = time(NULL);
+        return now > TIME_VALID_MIN ? fmtUtc((uint32_t)now)
+                                    : String("not NTP-synced yet");
+    }
     if (var == "HEAP_FREE")  return String(ESP.getFreeHeap() / 1024);
     if (var == "HEAP_SIZE")  return String(ESP.getHeapSize() / 1024);
     if (var == "HEAP_PCT")   return tmplEscape(pct(ESP.getHeapSize() - ESP.getFreeHeap(), ESP.getHeapSize()));
@@ -505,14 +759,40 @@ String EasyOTAClass::rootToken(const String &var)
     if (var == "DIAG") {
         String out, slot, sha;
         if (abortedSlot(slot, sha))
-            out += "Rolled back: " + slot + " holds an aborted image (sha " +
+            out += "Rolled back:            " + slot + " holds an aborted image (sha " +
                    sha.substring(0, 16) + "...)\n";
+        String clog = crashLogStored();
+        if (clog.length())
+            out += "Crashed boot's events:  " + tmplEscape(clog) + "\n";
         CrashInfo c = crashInfo();
         if (c.valid) {
-            out += "Last crash: task '" + tmplEscape(c.task) + "' at " + c.pc +
+            out += "Last crash:             task '" + tmplEscape(c.task) + "' at " + c.pc +
                    ", cause " + String(c.cause);
-            if (*excCauseName(c.cause)) out += " " + String(excCauseName(c.cause));
-            out += "\n             backtrace: " + c.bt + "  (crashing build " + c.elf + ")";
+            if (*excCauseName(c.cause)) out += ": " + String(excCauseName(c.cause));
+            out += ", vaddr " + hexAddr(c.vaddr) + "\n";
+            uint32_t ce = crashEpochStored();
+            time_t now = time(NULL);
+            out += "Crash time:             ";
+            if (ce) {
+                out += fmtUtc(ce);
+                if (now > TIME_VALID_MIN && (uint32_t)now >= ce)
+                    out += " (" + fmtDuration((uint32_t)now - ce) + " ago)";
+            } else {
+                out += "unknown (clock was not NTP-synced when it happened)";
+            }
+            out += "\n";
+            /* the core dump stores only the leading chars of the build sha;
+             * the "..." marks it as a prefix of the full hashes shown above */
+            out += "Crashing build:         " +
+                   (c.elf.length() ? c.elf : String("?")) + "...";
+            out += (c.elf.length() && runningSha().startsWith(c.elf))
+                       ? " (this build)" : " (a previous build)";
+            out += "\nBacktrace:              ";
+            for (uint32_t i = 0; i < c.depth; i++) {
+                if (i) out += "\n                        ";
+                out += hexAddr(c.bt[i]);
+            }
+            if (c.corrupted) out += "\n                        (corrupted)";
         }
         if (out.endsWith("\n")) out.remove(out.length() - 1);
         return out;
@@ -568,6 +848,9 @@ void EasyOTAClass::handleStatus(AsyncWebServerRequest *req)
     s += "\"boot_partition\":\"" + String(boot ? boot->label : "?") + "\",";
     s += "\"elf_sha256\":\"" + runningSha() + "\",";
     s += "\"uptime_s\":" + String(millis() / 1000) + ",";
+    s += "\"timeline\":\"" + jsonEscape(timelineNow()) + "\",";
+    time_t now = time(NULL);
+    s += "\"time\":" + String(now > TIME_VALID_MIN ? (uint32_t)now : 0) + ","; /* 0 = not synced */
 
     /* safeguard state (see crash-loop guard / reachability watchdog) */
     s += "\"guard\":{\"crash_resets\":" + String(guardCrashes) +
@@ -581,16 +864,20 @@ void EasyOTAClass::handleStatus(AsyncWebServerRequest *req)
         s += "\"aborted_slot\":\"" + abSlot + "\",";
         s += "\"aborted_sha\":\"" + abSha + "\",";
     }
+    String clog = crashLogStored();
+    if (clog.length())
+        s += "\"crash_timeline\":\"" + jsonEscape(clog) + "\",";
     CrashInfo crash = crashInfo();
     if (crash.valid) {
-        char vaddr[12];
-        snprintf(vaddr, sizeof(vaddr), "0x%08x", (unsigned)crash.vaddr);
         s += "\"crash_task\":\"" + jsonEscape(crash.task) + "\",";
         s += "\"crash_pc\":\"" + crash.pc + "\",";
         s += "\"crash_cause\":" + String(crash.cause) + ",";
-        s += "\"crash_vaddr\":\"" + String(vaddr) + "\",";
+        if (*excCauseName(crash.cause))
+            s += "\"crash_cause_name\":\"" + String(excCauseName(crash.cause)) + "\",";
+        s += "\"crash_vaddr\":\"" + hexAddr(crash.vaddr) + "\",";
+        s += "\"crash_time\":" + String(crashEpochStored()) + ","; /* epoch, 0 = unknown */
         s += "\"crash_elf\":\"" + crash.elf + "\",";
-        s += "\"crash_bt\":\"" + crash.bt + "\",";
+        s += "\"crash_bt\":\"" + backtraceOneLine(crash) + "\",";
     }
 
     s += "\"slots\":{";
@@ -676,20 +963,48 @@ bool EasyOTAClass::updateTooBig(size_t bodySize, size_t slack)
     return true;
 }
 
+/* Two uploads must not interleave chunks into one Update session. A second
+ * upload while the owner is still actively writing is rejected (marked via
+ * the request's _tempObject: a malloc'd flag the server frees with the
+ * request); a session whose owner went quiet - the client vanished
+ * mid-upload - is taken over instead, so an aborted curl doesn't lock the
+ * board's updater until reboot. */
+#define UPDATE_STALE_MS 10000
+bool EasyOTAClass::updateBusy(AsyncWebServerRequest *req)
+{
+    if (Update.isRunning() && req != _updateReq &&
+        millis() - _updateLastMs < UPDATE_STALE_MS) {
+        req->_tempObject = malloc(1);
+        Serial.println("[EasyOTA] update rejected: another one is in progress");
+        return true;
+    }
+    if (Update.isRunning()) {
+        Serial.println("[EasyOTA] stale update session (client vanished), taking over");
+        Update.abort();
+    }
+    _updateReq = req;
+    _updateLastMs = millis();
+    return false;
+}
+
 void EasyOTAClass::handleUpdateData(AsyncWebServerRequest *req, uint8_t *data,
                                     size_t len, size_t index, size_t total)
 {
     if (index == 0) {
+        if (updateBusy(req)) return;
         _updateErr = "";
         if (updateTooBig(total, 0)) return;
         Serial.println("[EasyOTA] update started");
-        if (Update.isRunning()) Update.abort(); /* client of a previous upload vanished */
+        event("update-start");
         Update.begin(total ? total : UPDATE_SIZE_UNKNOWN, U_FLASH);
     }
-    if (_updateErr.length()) return;
+    if (req->_tempObject || _updateErr.length()) return;
+    _updateLastMs = millis();
     if (!Update.hasError()) Update.write(data, len);
     if (index + len == total) {
         Update.end(true);
+        _updateReq = nullptr;
+        event("update-done");
         Serial.printf("[EasyOTA] update finished, %u bytes\n", (unsigned)total);
     }
 }
@@ -698,23 +1013,30 @@ void EasyOTAClass::handleUpdateForm(AsyncWebServerRequest *req, const String &fi
                                     size_t index, uint8_t *data, size_t len, bool final)
 {
     if (index == 0) {
+        if (updateBusy(req)) return;
         _updateErr = "";
         /* multipart framing adds < 1 KiB on top of the file itself */
         if (updateTooBig(req->contentLength(), 4096)) return;
         Serial.printf("[EasyOTA] form update started: %s\n", filename.c_str());
-        if (Update.isRunning()) Update.abort();
         Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
     }
-    if (_updateErr.length()) return;
+    if (req->_tempObject || _updateErr.length()) return;
+    _updateLastMs = millis();
     if (!Update.hasError()) Update.write(data, len);
     if (final) {
         Update.end(true);
+        _updateReq = nullptr;
         Serial.printf("[EasyOTA] form update finished, %u bytes\n", (unsigned)(index + len));
     }
 }
 
 void EasyOTAClass::handleUpdateDone(AsyncWebServerRequest *req)
 {
+    if (req->_tempObject) {
+        req->send(409, "text/plain",
+                  "another update is already in progress; retry when it finishes\n");
+        return;
+    }
     if (_updateErr.length()) {
         req->send(400, "text/plain", "update failed: " + _updateErr + "\n");
         _updateErr = "";

@@ -1,0 +1,4 @@
+Script started on 2026-07-17 13:41:47+02:00 [COMMAND="curl -f --progress-bar -H 'Content-Type: application/octet-stream' --data-binary @/home/jonas/code/minirack/firmware/app/.pio/build/lolin32/firmware.bin http://127.0.0.1:8199/update" <not executed on terminal>]
+ok
+
+Script done on 2026-07-17 13:41:59+02:00 [COMMAND_EXIT_CODE="0"]
