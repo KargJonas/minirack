@@ -10,7 +10,7 @@
 | ATX supply | PicoPSU (strict 12 V version) | Fed from regulated 12.0 V bus. |
 | Router | Dedicated OpenWrt device (NanoPi R-series / GL.iNet class), 12 V input | Rack is its own network, router is its root. Independent of the server: N100 can reboot without dropping VPN/network; KVM stays reachable out of band. |
 | NAS | Existing DS223j | 12 V bus. Hibernates during outages (load shedding). |
-| Monitoring | MCU + RTC, I2C sensors | INA226/INA3221 per rail, battery shunt (coulomb counting + mains-loss detection), AGM midpoint divider, temp/humidity, mic, IMU, diff. pressure. |
+| Monitoring | MCU + RTC, 3x ADS131M02 ADCs + I2C sensors | Synced ADCs: wall (CT+PT), 12V rail, 24V bus (high-side shunt+INA240 / dividers). Battery V/I/SOC from JK BMS over RS485. Temp/humidity, mic, IMU, diff. pressure over I2C. |
 
 ## Rack monitoring setup (and battery protection)
 
@@ -20,8 +20,37 @@ The WT32 is based on the ESP32-WROOM-32 (ESP32-D0WDQ6, Xtensa dual-core 32-bit L
 For precise power monitoring, we use 3x ADS131M02IRUKR dual-channel ADCs @ 32MHz.
 To monitor power draw at the wall, we use one of the ADCs with a CT on one channel and a PT on the other.
 This allows us to measure current and voltage waveforms highly precisely, since the channels are synced.
-We use a second ADC, but without transformers, on the 12V rail to get power draw and voltage stability there.
-The third ADC is unused (but I added it regardless since that means the board can be used e.g. for 3-phase power monitoring purposes in other projects).
+The other two ADCs monitor the DC rails (see below). Battery pack V/I/SOC come from the JK BMS over RS485, so the ADCs don't duplicate it.
+
+### DC rail monitoring
+
+The wall CT/PT are transformer-isolated, so ADC1 floats free of the board ground. The DC rails don't have that luxury: the Orion-Tr buck is **non-isolated**, so the 24V bus GND, the 12V rail GND and the board AGND are all one node. The ADS131M02 inputs only accept AGND-1.3V ... AVDD (~3.3V), so a shunt in the **+12V or +24V line** (common-mode 12-28V) can't be wired straight into the ADC — high-side sensing there would need a current-sense amplifier (INA240 etc.) or a discrete level-shifter to translate the bus common-mode down to ground. We sidestep that entirely:
+
+- **12V rail current -> low-side, ampless.** A 1 mΩ shunt in the 12V **return**. Both terminals sit within a few mV of ground, so it feeds the ADS **directly, no amplifier**, on the **gain-32 PGA**. The ADS's own ~±35 µV offset beats any cheap discrete amp we'd otherwise build.
+- **24V bus current -> derived, not measured.** bus current ≈ P12 / (V_bus · η_buck) from the measured 12V rail power and the measured bus voltage (η ≈ 0.97). This drops the one channel that would have needed a high-common-mode amp; buck efficiency and pack-side DC load still fall out of it.
+- **Both rail voltages -> resistor dividers** to GND (voltage sensing is inherently ground-referenced, so no amp, ever).
+
+Battery internals stay with the BMS; we only instrument the aggregate rails, not per-device branches.
+
+| ADC  | Ch  | Signal           | Front end                                 | PGA gain | Full scale at that gain      |
+| ---- | --- | ---------------- | ----------------------------------------- | -------- | ---------------------------- |
+| ADC1 | 0   | Wall current     | CT + burden (transformer-isolated)        | 1*       | size burden -> ~1.0V at max  |
+| ADC1 | 1   | Wall voltage     | PT + divider (isolated)                   | 1*       | ~1.0V at 325V pk             |
+| ADC2 | 0   | 12V rail voltage | divider ~11.5k/1k (÷12.5), Thevenin ~0.9k | 1        | 15V -> 1.2V (12V -> 0.96V)   |
+| ADC2 | 1   | 12V rail current | **low-side 1 mΩ shunt, direct to ADC**    | **32**   | 25A -> 25mV (FSR ±37.5mV)    |
+| ADC3 | 0   | 24V bus voltage  | divider ~26k/1k (÷27), Thevenin ~1k       | 1        | 32V -> 1.2V (28.8V -> 1.07V) |
+| ADC3 | 1   | 24V bus current  | *derived - channel unused*                | -        | -                            |
+
+*Wall gains assume the burden/PT are scaled so peak lands at ~1V; raise the PGA if the transformer output is smaller.
+
+Design notes:
+- **Gain strategy:** FSR = ±1.2 V / gain. Fill the range in the front end and keep the PGA at **gain=1** (best dynamic range for a range-filling signal). The low-side shunt is the deliberate exception: its raw 20 mV (20A) / 25 mV (25A peak) is tiny, so **gain=32** (FSR ±37.5 mV, ~53-67% used) recovers the SNR the amp would have. General rule: highest gain where `Imax · Rshunt < 0.9 · FSR` (e.g. a 2 mΩ shunt -> gain=16).
+- **Global-chop mode** (`GC_EN`, per-chip) nulls the ADC's internal offset/drift and improves noise by √2, at ~half the data rate. Our chips split clean on AC/DC lines: **chop ON for ADC2 & ADC3** (DC accuracy, half of ~32 kSPS is still plenty), **chop OFF for ADC1** (keep full rate for wall harmonics). Note: chop fixes only the ADC's own offset, not external front-end offset.
+- **Low-side placement + caveat:** put the shunt at the single 12V-return junction (buck output return -> star ground). It lifts the 12V loads' ground ~20 mV (negligible). It is vulnerable to **ground-loop bypass** if a 12V load has an alternate return to the star point (e.g. chassis bonding), so keep 12V returns star-wired *through* the shunt. A dead short would push the shunt node toward 12V, but that's a fuse event, not normal operation.
+- **Dividers deliberately low-impedance** (Thevenin ~1k). ADS Zin at gain 1-4 is `330 kΩ × 4.096 MHz / fMOD` = ~676 kΩ at 4 MHz CLKIN (fMOD = 2 MHz), so ~0.15% loading error; calibrate the exact ratio in firmware. Bleed ~1 mA / ~30 mW per divider.
+- **Calibration:** two-point (zero + known load) in firmware for the shunt channel. With gain=32 + global-chop the ADC's own contribution is negligible, so the shunt tolerance/tempco and the cal dominate accuracy.
+- **Anti-alias:** the existing 1k + 10nF input RC sets a ~16 kHz corner, coherent with ~32 kSPS (4 MHz CLKIN, HR mode). Captures 100/120 Hz ripple, load-step droop and the mains-loss -> battery sag envelope, but **not** the buck's ~500 kHz switching ripple. Resize the RC if switching-ripple visibility is ever wanted.
+- Being on the same phase-locked ADCs, the 12V sag can be correlated against the wall event in one timebase - useful for outage-handoff analysis.
 To get the battery voltage, current and power statistics, we should be able to tap into the JK BMS, and this data is also where we make the decision to dispatch a system shutdown command to the devices in case the battery level is critically low.
 To prevent deep discharge, we could also add a relay that opens after the shutdown is complete.
 Whether or not that disconnects *all* devices from the battery or everything but the ESP-board remains open.

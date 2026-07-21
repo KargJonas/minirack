@@ -28,5 +28,5 @@ digraph boot {
                     label="reachability watchdog: server\nunreachable 5 min -> reboot;\nstill after reboot -> mark\ninvalid, other slot"];
 
     // normal over-the-network paths
-    valid -> reset [style=dashed, label="/update, /reboot,\n/boot?part=..."];
+    valid -> reset [style=dashed, label="/easy-ota/update, /easy-ota/reboot,\n/easy-ota/boot?part=..."];
 }

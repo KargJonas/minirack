@@ -14,8 +14,26 @@
 #if __has_include("esp_core_dump.h")
 #include "esp_core_dump.h"
 #endif
+/* Free-running RTC counter (us since power-on): keeps ticking across a panic
+ * reset - so it can time the crashed boot - and, unlike the wall clock, is
+ * immune to the NTP step in begin(), so the delta needs no NTP. */
+#if __has_include("esp_private/esp_clk.h")
+#include "esp_private/esp_clk.h"
+#define EASYOTA_HAS_RTC_CLK 1
+#endif
+
+static inline uint64_t rtcNowUs()
+{
+#ifdef EASYOTA_HAS_RTC_CLK
+    return esp_clk_rtc_time();
+#else
+    return 0; /* clock unavailable -> crash uptime marker is simply omitted */
+#endif
+}
 
 EasyOTAClass EasyOTA;
+
+#define EASYOTA_PREFIX "/easy-ota"
 
 /* ------------------------------------------------------------------ */
 /* Safeguards. A/B rollback only covers images that crash before        */
@@ -57,15 +75,20 @@ RTC_NOINIT_ATTR static uint32_t crashStampEpoch;
  * boot (net up, server up, app events via EasyOTA.event()), kept in RTC
  * memory so that after a crash the next boot - possibly the other image -
  * can report how far the crashed boot got and when. bootlogHbMs is bumped
- * by every handle() as a cheap "loop was still alive at" marker: the crash
- * moment itself can't be stamped (the panic handler isn't ours), but the
- * last heartbeat brackets it to within one loop iteration. */
+ * by every handle() as a cheap "loop was still alive at" marker (a lower
+ * bound on the crash moment: within one loop iteration if loop() itself
+ * crashed, but stale if some other task did). The crash moment itself is
+ * timed after the fact from the RTC counter (bootRtcUs), giving an upper
+ * bound - the two bracket it. */
 #define BOOTLOG_MAGIC 0x52474432 /* "RGD2" */
 #define BOOTLOG_MAX 16
 #define BOOTLOG_TAGLEN 15
 RTC_NOINIT_ATTR static uint32_t bootlogMagic;
 RTC_NOINIT_ATTR static uint32_t bootlogCount;
 RTC_NOINIT_ATTR static uint32_t bootlogHbMs;
+/* RTC-counter value (us) at this boot's start. The crashed boot's value lets
+ * the next boot compute how long it ran before crashing. */
+RTC_NOINIT_ATTR static uint64_t bootRtcUs;
 RTC_NOINIT_ATTR static struct {
     uint32_t ms;
     char tag[BOOTLOG_TAGLEN + 1];
@@ -107,8 +130,17 @@ EasyOTAClass::EasyOTAClass()
                                 "%s%s@%ums", off ? " " : "",
                                 bootlogEv[i].tag, (unsigned)bootlogEv[i].ms);
             if (off < sizeof(crashTimeline) - 32)
+                off += snprintf(crashTimeline + off, sizeof(crashTimeline) - off,
+                                "%slast-alive@%ums", off ? " " : "", (unsigned)bootlogHbMs);
+            /* the crash itself: uptime of the crashed boot from the RTC
+             * counter (bootRtcUs was stamped at its start). Measured here,
+             * so it includes the panic+reboot latency to reach this ctor -
+             * an upper bound, a few hundred ms over the true moment. */
+            uint64_t now_us = rtcNowUs();
+            if (off < sizeof(crashTimeline) - 32 && bootRtcUs && now_us > bootRtcUs)
                 snprintf(crashTimeline + off, sizeof(crashTimeline) - off,
-                         "%slast-alive@%ums", off ? " " : "", (unsigned)bootlogHbMs);
+                         "%scrash@%ums", off ? " " : "",
+                         (unsigned)((now_us - bootRtcUs) / 1000));
         }
         if (++guardCrashes >= GUARD_CRASH_LIMIT) {
             guardCrashes = 0; /* don't re-fire every boot if rollback is impossible */
@@ -118,10 +150,12 @@ EasyOTAClass::EasyOTAClass()
             esp_rom_printf("[EasyOTA] rollback impossible (no valid other slot)\n");
         }
     }
-    /* fresh timeline for this boot */
+    /* fresh timeline for this boot; stamp the RTC counter as its zero so a
+     * later crash can be timed against it */
     bootlogMagic = BOOTLOG_MAGIC;
     bootlogCount = 0;
     bootlogHbMs = 0;
+    bootRtcUs = rtcNowUs();
     event("boot");
 }
 
@@ -175,7 +209,7 @@ static bool probeSelf(uint16_t port)
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     bool ok = false;
     if (connect(s, (struct sockaddr *)&a, sizeof(a)) == 0) {
-        const char req[] = "GET /status HTTP/1.0\r\n\r\n";
+        const char req[] = "GET " EASYOTA_PREFIX "/status HTTP/1.0\r\n\r\n";
         if (send(s, req, sizeof(req) - 1, 0) > 0) {
             char c;
             ok = recv(s, &c, 1, 0) > 0;
@@ -396,7 +430,7 @@ static CrashInfo crashInfo()
     return c;
 }
 
-/* Single-line form for /status: flash.sh greps crash_bt as one string. */
+/* Single-line form for /easy-ota/status: flash.sh greps crash_bt as one string. */
 static String backtraceOneLine(const CrashInfo &c)
 {
     String bt;
@@ -491,7 +525,7 @@ class PlainPostUpdateGuard : public AsyncWebHandler {
 public:
     bool canHandle(AsyncWebServerRequest *req) const override
     {
-        return req->method() == HTTP_POST && req->url() == "/update" &&
+        return req->method() == HTTP_POST && req->url() == EASYOTA_PREFIX "/update" &&
                req->contentType().startsWith("application/x-www-form-urlencoded");
     }
     void handleRequest(AsyncWebServerRequest *req) override
@@ -499,7 +533,7 @@ public:
         req->send(400, "text/plain",
                   "body would be parsed as a form and exhaust RAM; resend as:\n"
                   "curl -H 'Content-Type: application/octet-stream' "
-                  "--data-binary @firmware.bin http://<ip>/update\n");
+                  "--data-binary @firmware.bin http://<ip>" EASYOTA_PREFIX "/update\n");
     }
 };
 
@@ -533,28 +567,37 @@ void EasyOTAClass::begin(const char *appInfo, uint16_t port)
     _info = appInfo;
     _port = port;
     _server = new AsyncWebServer(port);
-    _server->on("/", HTTP_GET, [this](AsyncWebServerRequest *req) { handleRoot(req); });
-    _server->on("/status", HTTP_GET, [this](AsyncWebServerRequest *req) { handleStatus(req); });
+    /* All endpoints sit under EASYOTA_PREFIX. The dashboard is the bare prefix
+     * ("/easy-ota"), but ESPAsyncWebServer's default matcher is prefix-with-/
+     * (BackwardCompatible): "/easy-ota" would also match "/easy-ota/status" &
+     * co. So the specific sub-routes are registered first and win by order;
+     * the dashboard is registered last as the fall-through for the prefix. */
+    _server->on(EASYOTA_PREFIX "/status", HTTP_GET,
+                [this](AsyncWebServerRequest *req) { handleStatus(req); });
     _server->addHandler(new PlainPostUpdateGuard()); /* must precede /update */
-    _server->on("/update", HTTP_POST,
+    _server->on(EASYOTA_PREFIX "/update", HTTP_POST,
                 [this](AsyncWebServerRequest *req) { handleUpdateDone(req); },
                 nullptr,
                 [this](AsyncWebServerRequest *req, uint8_t *data, size_t len,
                        size_t index, size_t total) {
                     handleUpdateData(req, data, len, index, total);
                 });
-    _server->on("/update-form", HTTP_POST,
+    _server->on(EASYOTA_PREFIX "/update-form", HTTP_POST,
                 [this](AsyncWebServerRequest *req) { handleUpdateDone(req); },
                 [this](AsyncWebServerRequest *req, const String &filename, size_t index,
                        uint8_t *data, size_t len, bool final) {
                     handleUpdateForm(req, filename, index, data, len, final);
                 });
-    _server->on("/config", HTTP_POST, [this](AsyncWebServerRequest *req) { handleConfig(req); });
-    _server->on("/boot", HTTP_POST, [this](AsyncWebServerRequest *req) { handleBoot(req); });
-    _server->on("/reboot", HTTP_POST, [this](AsyncWebServerRequest *req) {
+    _server->on(EASYOTA_PREFIX "/config", HTTP_POST,
+                [this](AsyncWebServerRequest *req) { handleConfig(req); });
+    _server->on(EASYOTA_PREFIX "/boot", HTTP_POST,
+                [this](AsyncWebServerRequest *req) { handleBoot(req); });
+    _server->on(EASYOTA_PREFIX "/reboot", HTTP_POST, [this](AsyncWebServerRequest *req) {
         sendActionPage(req, "OK, rebooting");
         scheduleReboot();
     });
+    _server->on(EASYOTA_PREFIX, HTTP_GET,
+                [this](AsyncWebServerRequest *req) { handleRoot(req); });
     _server->begin();
     event("http-up");
 
@@ -622,8 +665,8 @@ void EasyOTAClass::sendActionPage(AsyncWebServerRequest *req, const String &msg)
               "<!DOCTYPE html><html><body><h1>" + htmlEscape(msg) + "</h1>"
               "<p>Waiting for the board to come back&hellip;</p>"
               "<script>async function poll(){"
-              "try{await fetch('/status',{cache:'no-store',signal:AbortSignal.timeout(1500)});"
-              "location.replace('/');}"
+              "try{await fetch('" EASYOTA_PREFIX "/status',{cache:'no-store',signal:AbortSignal.timeout(1500)});"
+              "location.replace('" EASYOTA_PREFIX "');}"
               "catch(e){setTimeout(poll,1000);}}"
               "setTimeout(poll,2000);</script></body></html>");
 }
@@ -651,7 +694,7 @@ Reason for last reset:  %LAST_RESET%
         </pre>
 
         <h2>Upload Firmware</h2>
-        <form method='POST' action='/update-form' enctype='multipart/form-data' id='fwform'>
+        <form method='POST' action='%OTA%/update-form' enctype='multipart/form-data' id='fwform'>
             <input type='file' name='fw'> <input type='submit' value='Flash'>
         </form>
         <p id='fwprog' style='display:none'>
@@ -670,7 +713,7 @@ Reason for last reset:  %LAST_RESET%
             var x = new XMLHttpRequest();
             var bar = document.getElementById('fwbar');
             var pct = document.getElementById('fwpct');
-            x.open('POST', '/update-form');
+            x.open('POST', '%OTA%/update-form');
             x.setRequestHeader('Accept', 'text/html'); /* want the action page */
             x.upload.onprogress = function(e) {
                 if (!e.lengthComputable) return;
@@ -707,7 +750,7 @@ Reason for last reset:  %LAST_RESET%
             The WiFi credentials are used to join an existing network (station mode).
         </p>
 
-        <form method='POST' action='/config'>
+        <form method='POST' action='%OTA%/config'>
         <table>
             <tr><td>Hostname</td><td><input name='hostname' value='%CFG_HOST%'></td></tr>
             <tr><td>WiFi SSID</td><td><input name='ssid' value='%CFG_SSID%'></td></tr>
@@ -717,8 +760,8 @@ Reason for last reset:  %LAST_RESET%
         </form>
 
         <h2>Actions</h2>
-        <form method='POST' action='/reboot'><input type='submit' value='Reboot'></form>
-        <form method='POST' action='/boot'>
+        <form method='POST' action='%OTA%/reboot'><input type='submit' value='Reboot'></form>
+        <form method='POST' action='%OTA%/boot'>
             <select name='part'>%BOOT_OPTS%</select>
             <input type='submit' value='Boot Selected Slot'>
         </form>
@@ -732,6 +775,7 @@ String EasyOTAClass::rootToken(const String &var)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
 
+    if (var == "OTA")        return EASYOTA_PREFIX; /* endpoint prefix for the forms */
     if (var == "HOST" || var == "CFG_HOST") return tmplEscape(hostname());
     if (var == "INFO")       return tmplEscape(_info);
     if (var == "CFG_SSID")   return tmplEscape(wifiSsid());
@@ -831,7 +875,7 @@ void EasyOTAClass::handleRoot(AsyncWebServerRequest *req)
 }
 
 /* ---------------------------------------------- */
-/* GET /status - everything, machine-readable     */
+/* GET /easy-ota/status - everything, machine-readable */
 /* ---------------------------------------------- */
 
 void EasyOTAClass::handleStatus(AsyncWebServerRequest *req)
@@ -919,7 +963,7 @@ void EasyOTAClass::handleStatus(AsyncWebServerRequest *req)
 }
 
 /* ------------------------------------------------------------------ */
-/* POST /config                                                        */
+/* POST /easy-ota/config                                               */
 /* ------------------------------------------------------------------ */
 
 void EasyOTAClass::handleConfig(AsyncWebServerRequest *req)
@@ -1063,7 +1107,7 @@ void EasyOTAClass::handleBoot(AsyncWebServerRequest *req)
     else if (req->hasParam("part", true))
         part = req->getParam("part", true)->value();
     if (!part.length()) {
-        req->send(400, "text/plain", "use /boot?part=ota_0|ota_1\n");
+        req->send(400, "text/plain", "use " EASYOTA_PREFIX "/boot?part=ota_0|ota_1\n");
         return;
     }
     const esp_partition_t *p = esp_partition_find_first(

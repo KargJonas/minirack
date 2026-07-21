@@ -1,19 +1,21 @@
 #pragma once
 /*
- * EasyOTA. Keep any ESP32 firmware updatable and inspectable over HTTP:
+ * EasyOTA. Keep any ESP32 firmware updatable and inspectable over HTTP. Every
+ * endpoint lives under the /easy-ota prefix, so the application keeps the
+ * whole rest of the URL space - including "/" - for its own routes:
  *
- *   GET  /             tiny HTML GUI: status, rollback diagnostics, firmware
- *                      upload, config
- *   GET  /status       one JSON object with everything (identity, slots,
- *                      memory, config, rollback diagnostics) - the
- *                      machine-readable interface
- *   POST /update       raw app image -> the other slot, reboot into it
- *                      curl -H 'Content-Type: application/octet-stream'
- *                           --data-binary @firmware.bin http://<ip>/update
- *   POST /update-form  same, as multipart/form-data (used by the GUI form)
- *   POST /config       persist hostname / wifi ssid / wifi pass to NVS + reboot
- *   POST /boot?part=<label>  boot a specific slot (ota_0|ota_1)
- *   POST /reboot       just reboot
+ *   GET  /easy-ota          tiny HTML GUI: status, rollback diagnostics,
+ *                           firmware upload, config
+ *   GET  /easy-ota/status   one JSON object with everything (identity, slots,
+ *                           memory, config, rollback diagnostics) - the
+ *                           machine-readable interface
+ *   POST /easy-ota/update   raw app image -> the other slot, reboot into it
+ *                        curl -H 'Content-Type: application/octet-stream'
+ *                        --data-binary @firmware.bin http://<ip>/easy-ota/update
+ *   POST /easy-ota/update-form  same, as multipart/form-data (GUI form)
+ *   POST /easy-ota/config   persist hostname / wifi ssid / pass to NVS + reboot
+ *   POST /easy-ota/boot?part=<label>  boot a specific slot (ota_0|ota_1)
+ *   POST /easy-ota/reboot   just reboot
  *
  * Discovery: the device advertises the mDNS service _easyota._tcp (TXT:
  * info, sha, part), so tools can find boards without knowing IP or
@@ -34,7 +36,7 @@
  *    wedged tasks); still unreachable after that reboot -> mark invalid and
  *    boot the previous image. Override the window with -DEASYOTA_WD_FAIL_MS.
  *
- * Crash diagnostics on / and /status: reset reason, core-dump summary of the
+ * Crash diagnostics on /easy-ota and /easy-ota/status: reset reason, core-dump summary of the
  * last crash (task, PC, cause, backtrace, which build) and its wall-clock
  * time. The clock is SNTP-synced in begin() (UTC; override the server with
  * -DEASYOTA_NTP_SERVER, default pool.ntp.org); crash timestamps work because
@@ -69,7 +71,8 @@ public:
      * The persisted hostname() is requested via DHCP. */
     void beginNetwork();
 
-    /* Call once after the network is up. appInfo is shown on / and /status. */
+    /* Call once after the network is up. appInfo is shown on /easy-ota and
+     * /easy-ota/status. */
     void begin(const char *appInfo = "", uint16_t port = 80);
     /* Call from loop(). Only services deferred reboots; HTTP is async. */
     void handle();
@@ -77,8 +80,11 @@ public:
     /* The underlying server, for app-specific routes (include
      * ESPAsyncWebServer.h and register after begin()):
      *   EasyOTA.server()->on("/mine", HTTP_GET, ...);
-     * Handlers match in registration order, so app routes can never shadow
-     * the EasyOTA endpoints. Prefer sharing this server over running a
+     * EasyOTA's own endpoints all live under /easy-ota, so the app is free to
+     * use "/" and any other path (just steer clear of /easy-ota). Handlers
+     * match in registration order, so app routes can never shadow the EasyOTA
+     * endpoints even if they did overlap. Prefer sharing this server over
+     * running a
      * second AsyncWebServer: every instance is serviced by the same
      * async_tcp task anyway (a second port adds no failure isolation), and
      * the reachability watchdog guards this one. A server from a different
@@ -95,7 +101,7 @@ public:
      * truncated) at the current time-since-boot. EasyOTA records boot,
      * net-begin/net-up, validated, http-up, mdns-up, update-start/-done and
      * reboot-sched by itself; add your app's milestones from setup() etc.
-     * The sequence shows on / and /status ("timeline"), and after a crash
+     * The sequence shows on /easy-ota and /easy-ota/status ("timeline"), and after a crash
      * the crashed boot's sequence survives into the rollback diagnostics
      * ("crash_timeline", with a last-alive heartbeat bracketing the crash
      * moment) - how far did bringup get, and when. */

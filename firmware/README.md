@@ -76,7 +76,7 @@ Drills (flash, watch it happen, board comes back on the previous image):
 ### Rollback diagnostics
 
 A rolled-back flash is not a black box. Four artifacts survive the rollback
-and are reported in `/status` (and on the GUI):
+and are reported in `/easy-ota/status` (and on the GUI):
 
 - `last_reset` — the crash's reset reason lives in RTC memory: `panic`,
   `interrupt-wdt`, `brownout`, ...
@@ -93,17 +93,19 @@ and are reported in `/status` (and on the GUI):
 
 - `crash_timeline` — the crashed boot's event sequence with
   time-since-boot stamps, e.g.
-  `boot@2ms net-begin@66ms net-up@1430ms last-alive@1430ms`: how far
-  bringup got and when, plus a `last-alive` heartbeat (bumped by every
-  `loop()`) bracketing the crash moment. Recorded in RTC memory, no NTP
-  involved. The running boot's sequence is always in `/status` as
+  `boot@2ms net-begin@66ms net-up@1430ms last-alive@1600ms crash@1720ms`:
+  how far bringup got and when, then two brackets around the crash moment —
+  `last-alive` (bumped by every `loop()`) is a lower bound, and `crash` is
+  the crashed boot's uptime timed from the free-running RTC counter (an
+  upper bound: it includes the panic+reboot latency). Both come from RTC,
+  no NTP involved. The running boot's sequence is always in `/easy-ota/status` as
   `timeline` (spot slow bringup); apps add their own milestones with
   `EasyOTA.event("sensors-up")` (built-ins: `boot`, `net-begin`,
   `net-up`, `validated`, `http-up`, `mdns-up`, `update-start`,
   `update-done`, `reboot-sched`).
 
 `flash.sh` prints all of this automatically when an upload gets rolled back.
-`/status` also reports the safeguard state (`guard.crash_resets`,
+`/easy-ota/status` also reports the safeguard state (`guard.crash_resets`,
 `guard.wd_stage`).
 
 ### Verified flashing: flash.sh
@@ -125,20 +127,24 @@ PHY). So a plain `flash.sh` builds, discovers, and flashes.
 
 Uploads, waits for the reboot, then proves *the exact build you uploaded* is
 what runs: every ESP32 image embeds a unique per-build SHA-256 (at file
-offset 176), which the device reports via `GET /status`. Exit 1 = device
+offset 176), which the device reports via `GET /easy-ota/status`. Exit 1 = device
 came back with a different image (rolled back — diagnostics get printed),
 2 = device never came back.
 
 ## HTTP API
 
+Every endpoint lives under `/easy-ota`, leaving the rest of the URL space
+(including `/`) to the application.
+
 ```sh
-curl http://<ip>/                                     # web GUI: status, rollback
+curl http://<ip>/easy-ota                             # web GUI: status, rollback
                                                       # diagnostics, upload form, config
                                                       # (JS only to auto-reload the GUI
                                                       # after reboot actions)
-curl http://<ip>/status                               # one JSON object with everything
+curl http://<ip>/easy-ota/status                      # one JSON object with everything
 curl -H 'Content-Type: application/octet-stream' \
-     --data-binary @firmware.bin http://<ip>/update   # flash other slot + boot it
+     --data-binary @firmware.bin \
+     http://<ip>/easy-ota/update                      # flash other slot + boot it
                                                       # (rejects images > slot size;
                                                       # 409 while another upload is
                                                       # actively running - but a stale
@@ -146,9 +152,10 @@ curl -H 'Content-Type: application/octet-stream' \
                                                       # is taken over after 10 s;
                                                       # content type required - curl's
                                                       # form default would be refused)
-curl -X POST "http://<ip>/boot?part=ota_0"            # or ota_1
-curl -X POST http://<ip>/reboot
-curl -d "hostname=device1&ssid=&pass=" http://<ip>/config  # empty = default/unchanged
+curl -X POST "http://<ip>/easy-ota/boot?part=ota_0"   # or ota_1
+curl -X POST http://<ip>/easy-ota/reboot
+curl -d "hostname=device1&ssid=&pass=" \
+     http://<ip>/easy-ota/config                      # empty = default/unchanged
 ```
 
 ### Adding your own endpoints
@@ -167,9 +174,11 @@ void setup() {
 }
 ```
 
-This is safe by construction: handlers match in registration order and
-`begin()` registers all EasyOTA routes first, so app routes (even greedy
-catch-alls) can never shadow `/update` & co. It is also no less robust
+This is safe by construction on two counts: EasyOTA's endpoints all live
+under `/easy-ota`, so `/` and every other path are the app's to use; and
+handlers match in registration order with `begin()` registering the EasyOTA
+routes first, so even an app route that did overlap `/easy-ota` (or a greedy
+catch-all) can never shadow `/easy-ota/update` & co. It is also no less robust
 than a second server — *all* ESPAsyncWebServer instances are serviced by
 the same `async_tcp` task, so a second port would share every failure
 mode anyway — and the reachability watchdog guards the shared server:
