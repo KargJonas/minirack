@@ -100,7 +100,7 @@ static void status() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== ESP32 CLKIN test (ADS131M02) — clock on GPIO14 ===");
+  Serial.println("\n=== ESP32 CLKIN test (ADS131M02) - clock on GPIO14 ===");
   Serial.println("cmds: <Hz> | A(pll) | L(edc) | ?(status)");
   apply();
   status();

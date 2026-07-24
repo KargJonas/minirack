@@ -1,20 +1,10 @@
-/*
- * Minirack monitor firmware. Runs on the WT32-ETH01 on the power board and
- * exposes the rack's electrical telemetry over the network, while staying
- * OTA-updatable and inspectable through EasyOTA (everything under /easy-ota;
- * this app owns "/" and /metrics).
- *
- * Sensing (see system-design/design.md for the analog front end):
- *   - DC rail voltages (12 V, 24 V) via resistor dividers to AGND
- *   - DC rail currents via shunts + ADS131M02 (low-side, ground-referenced)
- *   - wall power via transformer-isolated CT/PT into ADC1
- * The ADS131M02 / ADC driver is not wired up yet - readMetrics() returns
- * placeholders so the plumbing (bringup, OTA, the /metrics route) can be
- * exercised on real hardware first. TODO: implement the SPI driver.
- */
 #include <Arduino.h>
 #include <EasyOTA.h>
-#include <ESPAsyncWebServer.h> /* for app routes on EasyOTA.server() */
+#include <ESPAsyncWebServer.h>
+
+#include "adc.h"
+#include "i2cmux.h"
+#include "gpioext.h"
 
 #define APP_VERSION "rack-monitor built " __DATE__ " " __TIME__
 
@@ -59,14 +49,43 @@ void setup()
         digitalWrite(0, HIGH);
     });
 
-    /* App route on the shared server, registered after begin() so it can
+    adcBringupInit();
+    adcTestSerial();
+
+    i2cMuxInit();
+    i2cMuxTestSerial();
+
+    gpioExtInit();
+    gpioExtTestSerial();
+
+    /* App routes on the shared server, registered after begin() so they can
      * never shadow the EasyOTA endpoints (handlers match in registration
      * order). */
     EasyOTA.server()->on("/metrics", HTTP_GET, [](AsyncWebServerRequest *req) {
         req->send(200, "application/json", metricsJson());
     });
 
-    Serial.println("rack-monitor up; telemetry on /metrics");
+    /* Re-runs the ADC self-test live on each request. */
+    EasyOTA.server()->on("/adc-test", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "application/json", adcTestJson());
+    });
+
+    /* Re-runs the I2C mux scan live on each request. */
+    EasyOTA.server()->on("/mux-test", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "application/json", i2cMuxTestJson());
+    });
+
+    /* Deep diagnostic for the BMP280 on mux channel 0. */
+    EasyOTA.server()->on("/bmp-debug", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "application/json", bmp280DebugJson());
+    });
+
+    /* Re-runs the GPIO-expander register dump live on each request. */
+    EasyOTA.server()->on("/gpio-test", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "application/json", gpioExtTestJson());
+    });
+
+    Serial.println("rack-monitor up; /metrics, /adc-test, /mux-test");
 }
 
 void loop()

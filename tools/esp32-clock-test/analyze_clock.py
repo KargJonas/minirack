@@ -37,7 +37,7 @@ def capture_live(driver, samplerate, samples, outfile):
            "-c", f"samplerate={samplerate}",
            "--samples", str(samples),
            "-O", "binary", "-o", outfile]
-    print("• running:", " ".join(cmd), file=sys.stderr)
+    print("running:", " ".join(cmd), file=sys.stderr)
     subprocess.run(cmd, check=True)
 
 
@@ -74,7 +74,7 @@ def analyze(bits, fs, expect=None):
     print(f"  total edges      : {n_edges:,}  (rising {rising.size:,}, falling {falling.size:,})")
 
     if rising.size < 3:
-        print("\n  ✗ No periodic signal detected on this channel.")
+        print("\n  !! No periodic signal detected on this channel.")
         return
 
     # --- average frequency: the most trustworthy metric on an LA ---
@@ -114,10 +114,10 @@ def analyze(bits, fs, expect=None):
     print(f"  runt pulses (<0.5x): {glitches}")
 
     # --- caveats & verdict ---
-    print("\n  ── assessment ─────────────────────────────────────────────")
+    print("\n  === assessment ===")
     under = samples_per_period < 20
     if under:
-        print(f"  ⚠ Only {samples_per_period:.1f} samples/period. Period-jitter and duty")
+        print(f"  !! Only {samples_per_period:.1f} samples/period. Period-jitter and duty")
         print(f"    numbers above are dominated by the {t_res*1e9:.0f} ns sample quantization,")
         print("    NOT the real signal. Trust AVERAGE frequency + dropout counts only.")
         print("    For real jitter, use a scope or run the generator lower")
@@ -142,8 +142,8 @@ def analyze(bits, fs, expect=None):
         print(f"    [{'PASS' if ok else 'FAIL'}] {label}")
         allok = allok and ok
     print()
-    print("  ⇒", "Clock looks good for what this LA can measure."
-          if allok else "Clock has issues — see failed checks above.")
+    print("  =>", "Clock looks good for what this LA can measure."
+          if allok else "Clock has issues - see failed checks above.")
     if under:
         print("    (Reminder: fine jitter/edge quality still unverified without a scope.)")
 
@@ -172,9 +172,9 @@ def main():
     ch = args.channel
     if ch is None:
         ch, edges = pick_channel(path)
-        print(f"• auto-selected channel D{ch} ({edges:,} edges)", file=sys.stderr)
+        print(f" auto-selected channel D{ch} ({edges:,} edges)", file=sys.stderr)
     bits = load_bits(path, ch)
-    print(f"════ clock analysis: channel D{ch} ════")
+    print(f"=== clock analysis: channel D{ch} ===")
     analyze(bits, fs, args.expect)
 
     if tmp:
