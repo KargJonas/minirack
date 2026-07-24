@@ -1,6 +1,6 @@
 <mxfile host="Electron" agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/29.6.1 Chrome/142.0.7444.265 Electron/39.8.10 Safari/537.36" version="29.6.1">
   <diagram name="Page-1" id="1F8YJyy4WsrOfexKYPof">
-    <mxGraphModel dx="1185" dy="820" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+    <mxGraphModel dx="1185" dy="720" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -74,9 +74,10 @@
         <mxCell id="zsZzgbacnRyFui837Dge-50" edge="1" parent="1" source="zsZzgbacnRyFui837Dge-15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;endArrow=none;endFill=0;fillColor=#dae8fc;strokeColor=#6c8ebf;">
           <mxGeometry relative="1" as="geometry">
             <Array as="points">
-              <mxPoint x="610" y="250" />
+              <mxPoint x="640" y="250" />
+              <mxPoint x="640" y="190" />
             </Array>
-            <mxPoint x="610" y="190" as="targetPoint" />
+            <mxPoint x="640" y="190" as="targetPoint" />
           </mxGeometry>
         </mxCell>
         <mxCell id="zsZzgbacnRyFui837Dge-15" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Rack Monitor" vertex="1">
@@ -128,6 +129,30 @@
         </mxCell>
         <mxCell id="zsZzgbacnRyFui837Dge-40" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="JKBMS" vertex="1">
           <mxGeometry height="60" width="120" x="440" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="zsZzgbacnRyFui837Dge-57" edge="1" parent="1" source="zsZzgbacnRyFui837Dge-51" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;endArrow=none;endFill=0;">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="590" y="350" />
+              <mxPoint x="590" y="190" />
+            </Array>
+            <mxPoint x="640" y="190" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="zsZzgbacnRyFui837Dge-51" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Router" vertex="1">
+          <mxGeometry height="60" width="120" x="670" y="320" as="geometry" />
+        </mxCell>
+        <mxCell id="zsZzgbacnRyFui837Dge-56" edge="1" parent="1" source="zsZzgbacnRyFui837Dge-52" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;endArrow=none;endFill=0;">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="590" y="430" />
+              <mxPoint x="590" y="190" />
+            </Array>
+            <mxPoint x="580" y="190" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="zsZzgbacnRyFui837Dge-52" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="NAS" vertex="1">
+          <mxGeometry height="60" width="120" x="670" y="400" as="geometry" />
         </mxCell>
       </root>
     </mxGraphModel>

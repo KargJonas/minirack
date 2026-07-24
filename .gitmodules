@@ -1,0 +1,3 @@
+[submodule "firmware/easy-ota"]
+	path = firmware/easy-ota
+	url = git@github.com:KargJonas/easy-ota.git
