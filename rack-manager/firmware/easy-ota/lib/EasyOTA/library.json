@@ -1,0 +1,11 @@
+{
+  "name": "EasyOTA",
+  "version": "0.1.0",
+  "description": "Network bringup (WT32-ETH01 ethernet or WiFi station) plus HTTP OTA for any ESP32 app: /update (raw .bin via curl), /status, config and rollback diagnostics. Cancels bootloader rollback on begin().",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": {
+    "esp32async/AsyncTCP": "^3.3.2",
+    "esp32async/ESPAsyncWebServer": "^3.7.0"
+  }
+}

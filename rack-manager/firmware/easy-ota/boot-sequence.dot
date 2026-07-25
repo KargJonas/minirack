@@ -1,0 +1,32 @@
+// EasyOTA boot sequence.  Render with:  dot -Tsvg boot-sequence.dot -o boot-sequence.svg
+digraph boot {
+    rankdir=TB;
+    node  [shape=box, style=rounded, fontname="Helvetica", fontsize=11];
+    edge  [fontname="Helvetica", fontsize=9];
+
+    reset    [label="reset", shape=oval];
+    rom      [label="ROM bootloader"];
+    download [label="serial download mode\n(initial flash via esptool)"];
+    boot2    [label="2nd-stage bootloader\n(rollback enabled, immutable)"];
+    app      [label="selected slot boots (ota_0 / ota_1)\nfresh uploads start \"pending verify\""];
+    valid    [label="image running\n(validated, kept across reboots)"];
+
+    reset -> rom;
+    rom   -> download [label="IO0 low"];
+    rom   -> boot2    [label="IO0 high"];
+
+    boot2 -> app [label="otadata selects a slot\n(blank otadata = ota_0,\nthe serial-flashed base image)"];
+
+    app -> valid [label="EasyOTA.begin()\nmarks image valid"];
+    app -> reset [style=dashed, color=red, fontcolor=red,
+                  label="crash before begin():\nbootloader marks slot aborted,\nboots the other slot"];
+
+    // safeguards: escape hatches for bad-but-VALIDATED images
+    valid -> reset [style=dashed, color=red, fontcolor=red,
+                    label="crash-loop guard: 3 crash resets\nwithout 5 min stable uptime\n-> mark invalid, other slot"];
+    valid -> reset [style=dashed, color=red, fontcolor=red,
+                    label="reachability watchdog: server\nunreachable 5 min -> reboot;\nstill after reboot -> mark\ninvalid, other slot"];
+
+    // normal over-the-network paths
+    valid -> reset [style=dashed, label="/easy-ota/update, /easy-ota/reboot,\n/easy-ota/boot?part=..."];
+}
