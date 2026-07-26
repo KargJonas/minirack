@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <EasyOTA.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
 
 #include "adc.h"
+#include "adcstream.h"
 #include "i2cmux.h"
 #include "gpioexp.h"
 
@@ -25,6 +27,34 @@ static void onGpioExpChange(GpioExpPort port, uint8_t value, uint8_t changed)
 static Metrics readMetrics()
 {
     return Metrics{};
+}
+
+/* Collector address for the raw stream, in NVS so it survives an OTA and can
+ * be changed without a flash. Empty host means sample but do not stream. */
+static const char *NVS_NAMESPACE = "rackmon";
+
+static Preferences prefs;
+
+static String streamStatusJson()
+{
+    AdcStreamStats s = adcStreamGetStats();
+
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+             "{\"session\":%u,\"connected\":%s,\"connects\":%u,\"drops\":%u,"
+             "\"attempts\":%u,\"last_fail\":\"%s\",\"last_errno\":%d,"
+             "\"packets\":%u,\"frames_sampled\":%llu,\"frames_sent\":%llu,"
+             "\"frames_lost\":%llu,\"collector\":\"%s:%u\"}",
+             (unsigned)s.session, s.connected ? "true" : "false",
+             (unsigned)s.connects, (unsigned)s.drops,
+             (unsigned)s.attempts, adcStreamFailName(s.lastFailStage),
+             s.lastErrno, (unsigned)s.packets,
+             (unsigned long long)s.framesSampled,
+             (unsigned long long)s.framesSent,
+             (unsigned long long)s.framesLost,
+             prefs.getString("collector_host", "").c_str(),
+             (unsigned)prefs.getUShort("collector_port", 0));
+    return String(buf);
 }
 
 static String metricsJson()
@@ -56,6 +86,10 @@ void setup()
         digitalWrite(0, HIGH);
     });
 
+    /* Before the routes: the server is already accepting by this point, so a
+     * handler could otherwise reach an unopened Preferences. */
+    prefs.begin(NVS_NAMESPACE, false);
+
     adcInit();
     i2cMuxInit();
 
@@ -69,7 +103,46 @@ void setup()
         req->send(200, "application/json", metricsJson());
     });
 
-    Serial.println("rack-monitor up; /metrics");
+    /* Subpaths first, and this is not cosmetic: a handler matches when the URL
+     * merely starts with its pattern plus '/', so "/stream" registered ahead of
+     * these would answer /stream/hello and /stream/collector as well. */
+
+    /* The handshake exactly as the collector receives it, so the board can be
+     * asked what it thinks its own ADC configuration is without standing a
+     * collector up first. */
+    EasyOTA.server()->on("/stream/hello", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "application/json", adcStreamHelloJson());
+    });
+
+    /* Retarget the stream. Takes effect on the next boot: the pusher caches
+     * the address for the life of its task, and restarting it underneath a
+     * live connection buys nothing that a reboot does not. */
+    EasyOTA.server()->on("/stream/collector", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->hasParam("host")) {
+            req->send(400, "text/plain", "want ?host=<addr>&port=<n>\n");
+            return;
+        }
+        String   host = req->getParam("host")->value();
+        uint16_t port = req->hasParam("port")
+                            ? (uint16_t)req->getParam("port")->value().toInt()
+                            : 0;
+
+        prefs.putString("collector_host", host);
+        prefs.putUShort("collector_port", port);
+        req->send(200, "text/plain", "saved; reboot to apply\n");
+    });
+
+    /* General route last, for the reason above. */
+    EasyOTA.server()->on("/stream", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "application/json", streamStatusJson());
+    });
+
+    String   host = prefs.getString("collector_host", "");
+    uint16_t port = prefs.getUShort("collector_port", 0);
+
+    adcStreamBegin(host.c_str(), port);
+
+    Serial.println("rack-monitor up; /metrics /stream /stream/hello");
 }
 
 void loop()

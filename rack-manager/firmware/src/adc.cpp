@@ -129,6 +129,12 @@ static AdcGain s_gain[ADC_COUNT][ADC_CHANNELS] = {
     {ADC_GAIN_1, ADC_GAIN_1},
 };
 
+/* OSR and chop shadows, for the same reason and with the same caveat: they
+ * track what we last wrote, not what the chip currently holds. Seeded with the
+ * CLOCK and CFG reset values (OSR 1024, chop off). */
+static AdcOsr s_osr[ADC_COUNT]  = {ADC_OSR_1024, ADC_OSR_1024, ADC_OSR_1024};
+static bool   s_chop[ADC_COUNT] = {false, false, false};
+
 /* Chip-select bit masks for the direct GPIO path below. All three CS pins are
  * under 32, so one register pair covers them. */
 static uint32_t s_csMask[ADC_COUNT] = {0, 0, 0};
@@ -279,8 +285,12 @@ bool adcSetChop(AdcId adc, bool enable)
 {
     if (adc >= ADC_COUNT) return false;
 
-    return adcWriteRegister(adc, ADC_REG_CFG,
-                            enable ? (CFG_GC_DLY_DEF | CFG_GC_EN) : CFG_GC_DLY_DEF);
+    if (!adcWriteRegister(adc, ADC_REG_CFG,
+                          enable ? (CFG_GC_DLY_DEF | CFG_GC_EN) : CFG_GC_DLY_DEF))
+        return false;
+
+    s_chop[adc] = enable;
+    return true;
 }
 
 bool adcSetOsr(AdcId adc, AdcOsr osr)
@@ -296,7 +306,60 @@ bool adcSetOsr(AdcId adc, AdcOsr osr)
     else
         clock |= (uint16_t)((osr - 1) & 0x7) << CLOCK_OSR_POS;
 
-    return adcWriteRegister(adc, ADC_REG_CLOCK, clock);
+    if (!adcWriteRegister(adc, ADC_REG_CLOCK, clock)) return false;
+
+    s_osr[adc] = osr;
+    return true;
+}
+
+AdcGain adcGetGain(AdcId adc, AdcChannel channel)
+{
+    if (adc >= ADC_COUNT || channel >= ADC_CHANNELS) return ADC_GAIN_1;
+    return s_gain[adc][channel];
+}
+
+AdcOsr adcGetOsr(AdcId adc)
+{
+    return adc < ADC_COUNT ? s_osr[adc] : ADC_OSR_1024;
+}
+
+bool adcGetChop(AdcId adc)
+{
+    return adc < ADC_COUNT && s_chop[adc];
+}
+
+uint8_t adcGetChopDelay(AdcId adc)
+{
+    (void)adc;   // one value for every chip; adcSetChop() never varies it
+    return (uint8_t)((CFG_GC_DLY_DEF >> 9) & 0xF);
+}
+
+uint16_t adcGainMultiplier(AdcGain gain)
+{
+    return gain <= ADC_GAIN_128 ? (uint16_t)(1u << gain) : 1;
+}
+
+uint16_t adcOsrRatio(AdcOsr osr)
+{
+    /* OSR 64 is the TurboMode bit rather than an OSR[2:0] code, and the top of
+     * the range is 16256 rather than the 16384 the doubling would give. */
+    static const uint16_t RATIO[] = {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16256};
+    return osr <= ADC_OSR_16256 ? RATIO[osr] : 0;
+}
+
+uint32_t adcClkinHz(void)
+{
+    return CLKIN_HZ;
+}
+
+float adcFsrVolts(void)
+{
+    return ADC_FSR_V;
+}
+
+int adcDrdyPin(void)
+{
+    return PIN_DRDY;
 }
 
 bool adcDataReady()

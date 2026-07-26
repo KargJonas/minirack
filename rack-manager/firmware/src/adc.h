@@ -160,6 +160,43 @@ bool adcSetChop(AdcId adc, bool enable);
 bool adcSetOsr(AdcId adc, AdcOsr osr);
 
 /**
+ * Configuration read-back, from the driver's shadow rather than the bus.
+ *
+ * These exist for the stream handshake (adcstream.cpp): the server is told how
+ * the chips are configured and derives volts and amps itself, so nothing here
+ * needs to know what is wired to which input. Shadowed rather than read back
+ * because the handshake runs while the sampler is mid-stream and the SPI bus
+ * is busy every 104 us.
+ */
+AdcGain adcGetGain(AdcId adc, AdcChannel channel);
+AdcOsr  adcGetOsr(AdcId adc);
+bool    adcGetChop(AdcId adc);
+
+/* Global-chop delay, as the GC_DLY[3:0] register code. The driver pins this to
+ * the reset value; it is reported because it is a term in the conversion
+ * period (tGC_DLY + 3 x OSR x tMOD) and so sets the true sample rate. */
+uint8_t adcGetChopDelay(AdcId adc);
+
+/* The PGA gain as a multiplier (1..128) rather than the register code, so a
+ * consumer does not need TI's encoding table. */
+uint16_t adcGainMultiplier(AdcGain gain);
+
+/* The OSR as a ratio (64..16256) rather than the register code. */
+uint16_t adcOsrRatio(AdcOsr osr);
+
+/* CLKIN, in Hz, as generated on PIN_CLKIN. Together with the OSR, the chop
+ * state and the chop delay this is what determines the conversion period. */
+uint32_t adcClkinHz(void);
+
+/* Full-scale range in volts at gain 1 (datasheet 8.3: FSR = +/-1.2 V / gain).
+ * The other half of the count-to-volts scale, the first being the gain. */
+float adcFsrVolts(void);
+
+/* ADC1's DRDY pin, for a consumer that wants to drive sampling from its edge
+ * rather than polling adcDataReady(). */
+int adcDrdyPin(void);
+
+/**
  * True while ADC1 is holding DRDY low, meaning a conversion is waiting. Only
  * ADC1's DRDY is wired, but the shared CLKIN and SYNC/RESET phase-lock all
  * three and adcInit() gives them identical OSR and chop settings, so their
