@@ -199,7 +199,9 @@ void adcSync();
 /* Frames that failed their CRC since boot, per chip. */
 uint32_t adcCrcErrors(AdcId adc);
 
-/* Scale a sample code to volts at the ADC pin, using the gain currently set
+/**
+ * Scale a sample code to volts at the ADC pin, using the gain currently set
  * for that channel. Front-end scaling (dividers, shunt, CT/PT) is the
- * caller's business. Returns NAN for a bad argument. */
+ * caller's business. Returns NAN for a bad argument.
+ */
 float adcVolts(AdcId adc, AdcChannel channel, int32_t code);

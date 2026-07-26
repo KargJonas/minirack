@@ -38,7 +38,7 @@ Battery internals stay with the BMS; we only instrument the aggregate rails, not
 | ADC1 | 1   | Wall voltage     | PT + divider (isolated)                   | 1*       | ~1.0V at 325V pk             |
 | ADC2 | 0   | 12V rail voltage | divider ~11.5k/1k (÷12.5), Thevenin ~0.9k | 1        | 15V -> 1.2V (12V -> 0.96V)   |
 | ADC2 | 1   | 12V rail current | **low-side 1 mΩ shunt, direct to ADC**    | **32**   | 25A -> 25mV (FSR ±37.5mV)    |
-| ADC3 | 0   | 24V bus voltage  | divider ~26k/1k (÷27), Thevenin ~1k       | 1        | 32V -> 1.2V (28.8V -> 1.07V) |
+| ADC3 | 0   | 24V bus voltage  | divider ~26k/1k (÷27), Thevenin ~1k       | 1        | 32V -> 1.2V (25.6V -> 0.95V) |
 | ADC3 | 1   | 24V bus current  | *derived - channel unused*                | -        | -                            |
 
 *Wall gains assume the burden/PT are scaled so peak lands at ~1V; raise the PGA if the transformer output is smaller.
@@ -51,6 +51,7 @@ Design notes:
   - 9.6 kSPS is 192 samples per 50 Hz cycle, Nyquist at the 96th harmonic - roughly 2× the margin IEC 61000-4-7 asks for (50th). The earlier worry about "full rate for wall harmonics" on ADC1 was unfounded.
   - Uniform settings are also what keeps the three conversion periods equal, so ADC1's DRDY (the only one wired) speaks for all three. Splitting chop or OSR across chips breaks that.
 - **Low-side placement + caveat:** put the shunt at the single 12V-return junction (buck output return -> star ground). It lifts the 12V loads' ground ~20 mV (negligible). It is vulnerable to **ground-loop bypass** if a 12V load has an alternate return to the star point (e.g. chassis bonding), so keep 12V returns star-wired *through* the shunt. A dead short would push the shunt node toward 12V, but that's a fuse event, not normal operation.
+- **Bus divider headroom:** sized when the pack was 8S (28.8 V -> 1.07 V of the 1.2 V FSR). At 7S the bus peaks at 25.6 V -> ~0.95 V, so slightly less of the range is used. Harmless, and the boards are already manufactured.
 - **Dividers deliberately low-impedance** (Thevenin ~1k). ADS Zin at gain 1-4 is `330 kΩ × 4.096 MHz / fMOD` = ~676 kΩ at 4 MHz CLKIN (fMOD = 2 MHz), so ~0.15% loading error; calibrate the exact ratio in firmware. Bleed ~1 mA / ~30 mW per divider.
 - **Calibration:** two-point (zero + known load) in firmware for the shunt channel. With gain=32 + global-chop the ADC's own contribution is negligible, so the shunt tolerance/tempco and the cal dominate accuracy.
 - **Anti-alias:** the existing 1k + 10nF input RC sets a ~16 kHz corner. Captures 100/120 Hz ripple, load-step droop and the mains-loss -> battery sag envelope, but **not** the buck's ~500 kHz switching ripple.
@@ -82,22 +83,25 @@ We'll likely go with 4MHz, which gives us a clean signal, while still allowing 3
 
 24 V battery bus, charger-supplied - battery is the UPS, zero transfer time.
 
-**Battery decision (iteration 2+):** 8S LiFePO4 from the start instead of AGM. 8x EVE LF50K 3.2 V 50Ah grade-A cells (~EUR 136) + JK BMS came in cheaper than the AGM pair and skips the mid-life battery swap. Charger sized up to NPB-360-24 so the 50Ah pack recharges in ~5 h under load (the NPB-120's ~3.4 A left under 1 A for charging after the ~2.4 A base load).
+**Battery decision (iteration 2+):** LiFePO4 from the start instead of AGM. EVE LF50K 3.2 V 50Ah grade-A cells (~EUR 136) + JK BMS came in cheaper than the AGM pair and skips the mid-life battery swap. Charger sized up to NPB-360-24 so the 50Ah pack recharges in ~5 h under load (the NPB-120's ~3.4 A left under 1 A for charging after the ~2.4 A base load).
+
+**Revised to 7S (iteration 3):** eight cells plus the BMS do not physically fit the 10" enclosure. Dropped to 7S, which the BMS supports natively. Costs 12.5 % of the energy and nothing else. Full pack detail, wiring, charger setup and commissioning live in [`bms/README.md`](../bms/README.md).
 
 ```mermaid
 flowchart TD
-    AC[AC mains] --> CHG["NPB-360-24TB charger<br/>DIP: Li 2-stage, CV 28.8 V"]
+    AC[AC mains] --> CHG["NPB-360-24TB charger<br/>Li 2-stage, CV 24.2 V (3.45 V/cell)"]
     CHG -->|10 A fuse| BUS["24 V bus bar<br/>fuse per branch"]
-    BAT["8S EVE LF50K LiFePO4 50Ah<br/>JK-B1A8S10P BMS (1 A active balance, cell UV/OV cutoff)"] <-->|main fuse 20 A at battery +| BUS
+    BAT["7S EVE LF50K LiFePO4 50Ah (22.4 V nom)<br/>JK-B1A8S10P BMS (1 A active balance, cell UV/OV cutoff)"] <-->|main fuse 20 A at battery +| BUS
     BUS -->|10 A fuse| BUCK["Victron Orion-Tr 24/12-20 (240W), non-isolated<br/>18-35 V in, 12.5 V out, 20 A cont / 25 A peak, 97%"]
     BUCK --> DIST["12.0 V blade-fuse block"]
     DIST --> LOADS["PicoPSU / NAS / switch / KVM / fans / MCU"]
 ```
 
 - MCU does orderly shutdown on **SOC read from the JK BMS over UART/RS485**, not a bus-voltage threshold - the LiFePO4 discharge curve is too flat for voltage triggers. BMS cell-level undervoltage cutoff is the backstop; a separate LVD module is optional.
-- **Float aging caveat:** the NPB Li profile holds 28.8 V (3.6 V/cell) continuously, which ages LiFePO4 held at full. Prefer the programmable variant (SBP-001 / CANbus) set to ~27.6 V (3.45 V/cell), or mitigate via BMS charge cutoff.
-- Star wiring from bus bar, not stacked lugs; 2.5 mm2 branches. Top-balance cells before first assembly; compression fixture for the prismatic pack.
-- Runtime: ~27 h full load / ~38 h shed (50Ah); router stays powered in shed mode (VPN up during outages). Wall-to-device efficiency ~86 %; on battery ~94 % (no inverter).
+- **The Orion-Tr's 18 V input floor is the binding low-end constraint at 7S.** It corresponds to 2.57 V/cell (at 8S it was 2.25 V/cell, which never mattered). The BMS UV cutoff must stay above ~2.6 V/cell or the 12 V rail dies from buck dropout *before* the BMS protects. The planned 2.8-3.0 V/cell clears it, but the margin is thinner than the 8S design assumed - see `bms/README.md`.
+- **Float aging caveat:** the NPB Li profile's DIP default is 28.8 V, which is 8S-specific and would be 4.11 V/cell at 7S. CV is set by pot to **24.2 V (3.45 V/cell)**, which also avoids holding the pack at full continuously.
+- Star wiring from bus bar, not stacked lugs; 2.5 mm2 branches. Inter-cell links are wire, not busbar, sized to the BMS's 100 A ceiling. Top-balance cells before first assembly; compression fixture for the prismatic pack.
+- Runtime: ~24 h full load / ~33 h shed (7S, 50Ah, 1.12 kWh); router stays powered in shed mode (VPN up during outages). Wall-to-device efficiency ~86 %; on battery ~94 % (no inverter).
 
 ## 3V3 rail power budget
 
