@@ -29,8 +29,9 @@ static Metrics readMetrics()
     return Metrics{};
 }
 
-/* Collector address for the raw stream, in NVS so it survives an OTA and can
- * be changed without a flash. Empty host means sample but do not stream. */
+/* Raw-stream listen port, in NVS so it survives an OTA and can be changed
+ * without a flash. 0 means sample but do not stream. The collector finds
+ * the board by browsing _easyota._tcp and dials in. */
 static const char *NVS_NAMESPACE = "rackmon";
 
 static Preferences prefs;
@@ -39,21 +40,21 @@ static String streamStatusJson()
 {
     AdcStreamStats s = adcStreamGetStats();
 
-    char buf[320];
+    char buf[352];
     snprintf(buf, sizeof(buf),
-             "{\"session\":%u,\"connected\":%s,\"connects\":%u,\"drops\":%u,"
-             "\"attempts\":%u,\"last_fail\":\"%s\",\"last_errno\":%d,"
+             "{\"session\":%u,\"listening\":%s,\"port\":%u,\"connected\":%s,"
+             "\"collector\":\"%s\",\"connects\":%u,\"drops\":%u,"
+             "\"last_fail\":\"%s\",\"last_errno\":%d,"
              "\"packets\":%u,\"frames_sampled\":%llu,\"frames_sent\":%llu,"
-             "\"frames_lost\":%llu,\"collector\":\"%s:%u\"}",
-             (unsigned)s.session, s.connected ? "true" : "false",
+             "\"frames_lost\":%llu}",
+             (unsigned)s.session, s.listening ? "true" : "false",
+             (unsigned)s.port, s.connected ? "true" : "false", s.peer,
              (unsigned)s.connects, (unsigned)s.drops,
-             (unsigned)s.attempts, adcStreamFailName(s.lastFailStage),
+             adcStreamFailName(s.lastFailStage),
              s.lastErrno, (unsigned)s.packets,
              (unsigned long long)s.framesSampled,
              (unsigned long long)s.framesSent,
-             (unsigned long long)s.framesLost,
-             prefs.getString("collector_host", "").c_str(),
-             (unsigned)prefs.getUShort("collector_port", 0));
+             (unsigned long long)s.framesLost);
     return String(buf);
 }
 
@@ -105,7 +106,7 @@ void setup()
 
     /* Subpaths first, and this is not cosmetic: a handler matches when the URL
      * merely starts with its pattern plus '/', so "/stream" registered ahead of
-     * these would answer /stream/hello and /stream/collector as well. */
+     * these would answer /stream/hello and /stream/port as well. */
 
     /* The handshake exactly as the collector receives it, so the board can be
      * asked what it thinks its own ADC configuration is without standing a
@@ -114,21 +115,22 @@ void setup()
         req->send(200, "application/json", adcStreamHelloJson());
     });
 
-    /* Retarget the stream. Takes effect on the next boot: the pusher caches
-     * the address for the life of its task, and restarting it underneath a
-     * live connection buys nothing that a reboot does not. */
-    EasyOTA.server()->on("/stream/collector", HTTP_GET, [](AsyncWebServerRequest *req) {
-        if (!req->hasParam("host")) {
-            req->send(400, "text/plain", "want ?host=<addr>&port=<n>\n");
+    /* Move the stream to another port, or turn it off with port=0. Takes
+     * effect on the next boot: the pusher binds once for the life of its task,
+     * and rebinding underneath a live collector buys nothing that a reboot
+     * does not. Rarely needed - the default is the whole point. */
+    EasyOTA.server()->on("/stream/port", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->hasParam("port")) {
+            req->send(400, "text/plain", "want ?port=<n>  (0 disables)\n");
             return;
         }
-        String   host = req->getParam("host")->value();
-        uint16_t port = req->hasParam("port")
-                            ? (uint16_t)req->getParam("port")->value().toInt()
-                            : 0;
+        long port = req->getParam("port")->value().toInt();
+        if (port < 0 || port > 65535) {
+            req->send(400, "text/plain", "port out of range\n");
+            return;
+        }
 
-        prefs.putString("collector_host", host);
-        prefs.putUShort("collector_port", port);
+        prefs.putUShort("stream_port", (uint16_t)port);
         req->send(200, "text/plain", "saved; reboot to apply\n");
     });
 
@@ -137,10 +139,7 @@ void setup()
         req->send(200, "application/json", streamStatusJson());
     });
 
-    String   host = prefs.getString("collector_host", "");
-    uint16_t port = prefs.getUShort("collector_port", 0);
-
-    adcStreamBegin(host.c_str(), port);
+    adcStreamBegin(prefs.getUShort("stream_port", ADC_STREAM_PORT));
 
     Serial.println("rack-monitor up; /metrics /stream /stream/hello");
 }

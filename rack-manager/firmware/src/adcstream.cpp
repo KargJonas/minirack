@@ -3,27 +3,36 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
-#include <lwip/netdb.h>
+#include <lwip/inet.h>
 #include <lwip/sockets.h>
 
 #include "adc.h"
 #include "wire.h"
 
 /* ---------------------------------------------------------------------------
- * Raw ADC stream: sampler task, ring, and the TCP client that drains it.
+ * Raw ADC stream: sampler task, ring, and the TCP server that drains it.
  *
  * The split of work follows system-design/rack-manager.md section 1: the
  * sampler owns core 1 and must never block, the network stack stays on core 0.
  * Everything between them goes through one bounded ring, and the only
  * backpressure mechanism is dropping its oldest frames.
+ *
+ * The collector dials in (see the header for why) and the board pushes into
+ * the accepted socket. Everything below the accept - packet building, the
+ * ring, the drop rules - is untouched by that: the socket is the same socket.
  * ------------------------------------------------------------------------- */
 
-static const uint32_t CONNECT_TIMEOUT_S = 5;
-static const uint32_t SEND_TIMEOUT_S    = 2;
+static const uint32_t SEND_TIMEOUT_S = 2;
 
-/* Reconnect backoff, doubling from the first to the second. */
+/* Retry backoff for a listener that will not come up, doubling. Not a
+ * reconnect backoff: waiting for a collector costs nothing and blocks in
+ * accept() rather than spinning. */
 static const uint32_t BACKOFF_MIN_MS = 1000;
 static const uint32_t BACKOFF_MAX_MS = 30000;
+
+/* How often, in packets sent, the listener is checked for a collector trying
+ * to take over. ~10 ms per packet, so ~0.5 s of stale stream at worst. */
+static const uint32_t TAKEOVER_CHECK_PACKETS = 50;
 
 /* TCP keepalive: a collector that dies without sending FIN would otherwise
  * absorb writes into lwIP's retransmit timer for minutes. */
@@ -31,13 +40,11 @@ static const int KEEPALIVE_IDLE_S  = 5;
 static const int KEEPALIVE_INTVL_S = 2;
 static const int KEEPALIVE_COUNT   = 3;
 
-static char     s_host[64] = {0};
-static uint16_t s_port     = 0;
-static uint32_t s_session  = 0;
+static uint16_t s_port    = 0;
+static uint32_t s_session = 0;
 
-/* Why the last connect attempt failed. Declared up here because
- * connectCollector() sets them and it comes before the pusher's own counters. */
-static uint32_t s_attempts  = 0;
+static bool     s_listening = false;
+static char     s_peer[16]  = {0};
 static uint8_t  s_failStage = ADCSTREAM_FAIL_NONE;
 static int      s_failErrno = 0;
 
@@ -281,73 +288,104 @@ static void applySocketOptions(int fd)
      * therefore the real buffer, which is what it was sized for. */
 }
 
-static int connectCollector(void)
+/**
+ * The listening socket. Non-blocking, because the pusher has to be able to ask
+ * "has anyone else turned up?" mid-stream without giving up the collector it
+ * already has - see acceptCollector().
+ */
+static int openListener(void)
 {
-    struct addrinfo hints = {};
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    char portStr[8];
-    snprintf(portStr, sizeof(portStr), "%u", (unsigned)s_port);
-
-    s_attempts++;
-
-    struct addrinfo *res = nullptr;
-    if (getaddrinfo(s_host, portStr, &hints, &res) != 0 || res == nullptr) {
-        s_failStage = ADCSTREAM_FAIL_RESOLVE;
-        s_failErrno = errno;
-        return -1;
-    }
-
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         s_failStage = ADCSTREAM_FAIL_SOCKET;
         s_failErrno = errno;
-        freeaddrinfo(res);
         return -1;
     }
 
-    /* Non-blocking for the connect only. A collector that black-holes SYNs
-     * would otherwise hold this task for lwIP's full retransmit sequence, and
-     * a collector that came back in the meantime would not be noticed. */
+    /* A collector that vanished leaves the old connection in TIME_WAIT holding
+     * the port; without this a reboot or a takeover would fail to bind for two
+     * minutes and look exactly like a dead board. */
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr = {};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = htons(s_port);
+
+    /* Backlog of 1: there is meant to be one collector, and a second one is
+     * handled by taking over rather than by queueing. */
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 1) != 0) {
+        s_failStage = ADCSTREAM_FAIL_BIND;
+        s_failErrno = errno;
+        close(fd);
+        return -1;
+    }
+
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
+    s_failStage = ADCSTREAM_FAIL_NONE;
+    s_failErrno = 0;
+    return fd;
+}
 
-    if (rc != 0) {
-        if (errno != EINPROGRESS) {
-            s_failStage = ADCSTREAM_FAIL_CONNECT;
-            s_failErrno = errno;
-            close(fd);
-            return -1;
-        }
+/* acceptCollector() when there is no collector to take. Distinguished because
+ * "nobody is waiting" is the normal state and "the listener is broken" needs a
+ * rebind - and a broken one is not merely rare: select() returns immediately on
+ * a bad descriptor, so treating the two alike spins this task at full speed. */
+static const int ACCEPT_NOBODY = -1;
+static const int ACCEPT_BROKEN = -2;
 
-        fd_set wr;
-        FD_ZERO(&wr);
-        FD_SET(fd, &wr);
+/**
+ * Take the next collector off the listener.
+ *
+ * 'wait' blocks in select() for up to a second, which is how the pusher idles
+ * when it has no collector at all. Mid-stream the same call is made with
+ * wait=false, so a fresh collector is picked up without stalling the packets
+ * going to the current one.
+ *
+ * The newcomer always wins. The collector only redials after its own read
+ * failed, so it is the authority on whether the old socket is dead - the same
+ * argument the server used to make in the other direction, now that the roles
+ * have swapped. Keepalive would notice the corpse eventually (11 s), but a
+ * collector that has already restarted should not have to wait for that.
+ */
+static int acceptCollector(int lfd, bool wait)
+{
+    if (wait) {
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(lfd, &rd);
         struct timeval tv = {};
-        tv.tv_sec = CONNECT_TIMEOUT_S;
+        tv.tv_sec = 1;
 
-        if (select(fd + 1, nullptr, &wr, nullptr, &tv) <= 0) {
-            s_failStage = ADCSTREAM_FAIL_TIMEOUT;
+        int rc = select(lfd + 1, &rd, nullptr, nullptr, &tv);
+        if (rc == 0) return ACCEPT_NOBODY;
+        if (rc < 0) {
+            s_failStage = ADCSTREAM_FAIL_ACCEPT;
             s_failErrno = errno;
-            close(fd);
-            return -1;
-        }
-
-        int       err = 0;
-        socklen_t len = sizeof(err);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) {
-            s_failStage = ADCSTREAM_FAIL_REFUSED;
-            s_failErrno = err;
-            close(fd);
-            return -1;
+            return ACCEPT_BROKEN;
         }
     }
 
-    fcntl(fd, F_SETFL, flags);
+    struct sockaddr_in peer = {};
+    socklen_t          len  = sizeof(peer);
+
+    int fd = accept(lfd, (struct sockaddr *)&peer, &len);
+    if (fd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return ACCEPT_NOBODY;
+        s_failStage = ADCSTREAM_FAIL_ACCEPT;
+        s_failErrno = errno;
+        return ACCEPT_BROKEN;
+    }
+
+    /* Inherited O_NONBLOCK would turn every send into a partial write. */
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+
+    inet_ntoa_r(peer.sin_addr, s_peer, sizeof(s_peer));
     applySocketOptions(fd);
     s_failStage = ADCSTREAM_FAIL_NONE;
     s_failErrno = 0;
@@ -416,33 +454,55 @@ static uint8_t channelMask(void)
 static void pusherTask(void *)
 {
     uint32_t backoffMs = BACKOFF_MIN_MS;
+    int      lfd       = -1;
+    int      fd        = -1;   /* carried over from a takeover, if any */
 
     for (;;) {
-        int fd = connectCollector();
-        if (fd < 0) {
-            vTaskDelay(pdMS_TO_TICKS(backoffMs));
-            backoffMs = backoffMs * 2 > BACKOFF_MAX_MS ? BACKOFF_MAX_MS
-                                                       : backoffMs * 2;
-            continue;
+        /* The listener is the one thing worth retrying with backoff: if the
+         * port cannot be bound, nothing else can happen. */
+        if (lfd < 0) {
+            lfd = openListener();
+            if (lfd < 0) {
+                s_listening = false;
+                Serial.printf("[adcstream] listen on %u failed: %s errno %d\n",
+                              (unsigned)s_port, adcStreamFailName(s_failStage),
+                              s_failErrno);
+                vTaskDelay(pdMS_TO_TICKS(backoffMs));
+                backoffMs = backoffMs * 2 > BACKOFF_MAX_MS ? BACKOFF_MAX_MS
+                                                           : backoffMs * 2;
+                continue;
+            }
+            s_listening = true;
+            backoffMs   = BACKOFF_MIN_MS;
+            Serial.printf("[adcstream] listening on :%u\n", (unsigned)s_port);
         }
 
-        /* A collector that accepts and then drops the handshake would
-         * otherwise be reconnected to as fast as the LAN allows, so a failed
-         * hello backs off exactly like a failed connect. */
+        /* Waiting for a collector is free - accept() blocks in select() rather
+         * than spinning - so there is no backoff on this path at all. A broken
+         * listener is the exception: it can only be recovered by rebinding,
+         * and that does go through the backoff above. */
+        if (fd < 0) {
+            fd = acceptCollector(lfd, true);
+            if (fd == ACCEPT_BROKEN) {
+                close(lfd);
+                lfd = -1;
+                s_listening = false;
+            }
+            if (fd < 0) continue;
+        }
+
+        /* A collector that connects and then drops the handshake would
+         * otherwise be re-accepted as fast as the LAN allows. */
         if (!sendHello(fd)) {
             s_failStage = ADCSTREAM_FAIL_HELLO;
             s_failErrno = errno;
             close(fd);
-            vTaskDelay(pdMS_TO_TICKS(backoffMs));
-            backoffMs = backoffMs * 2 > BACKOFF_MAX_MS ? BACKOFF_MAX_MS
-                                                       : backoffMs * 2;
+            fd = -1;
+            s_peer[0] = '\0';
+            vTaskDelay(pdMS_TO_TICKS(BACKOFF_MIN_MS));
             continue;
         }
 
-        /* Reset only once the connection is good for something. Resetting on
-         * the accept alone would let a collector that accepts and immediately
-         * drops be retried at full speed forever. */
-        backoffMs = BACKOFF_MIN_MS;
         s_connects++;
         s_connected = true;
 
@@ -452,6 +512,8 @@ static void pusherTask(void *)
         uint64_t readIdx  = ringWriteIdx();
         bool     gap      = false;
         uint32_t crcSeen  = crcErrorTotal();
+        uint32_t sinceChk = 0;
+        int      next     = -1;   /* a collector taking over */
 
         for (;;) {
             uint64_t startIdx = 0;
@@ -482,17 +544,32 @@ static void pusherTask(void *)
             gap = false;
             s_packets++;
             s_framesSent += n;
+
+            /* Checked between packets, never mid-packet: a half-written packet
+             * handed off to a new collector would desynchronise it. */
+            if (++sinceChk >= TAKEOVER_CHECK_PACKETS) {
+                sinceChk = 0;
+                next = acceptCollector(lfd, false);
+                if (next >= 0) break;
+            }
         }
 
         s_connected = false;
         s_drops++;
         close(fd);
+
+        /* The newcomer starts the next iteration with its own hello and its
+         * own ring cursor, exactly as a first connection would. Anything else
+         * (nobody, or a listener that has gone bad) goes back to accepting,
+         * which is where the rebind lives. */
+        fd = next >= 0 ? next : -1;
+        if (fd < 0) s_peer[0] = '\0';
     }
 }
 
 /* --- public -------------------------------------------------------------- */
 
-bool adcStreamBegin(const char *host, uint16_t port)
+bool adcStreamBegin(uint16_t port)
 {
     if (!wireSelfTest()) {
         Serial.println("[adcstream] wire self-test FAILED - not starting");
@@ -511,12 +588,11 @@ bool adcStreamBegin(const char *host, uint16_t port)
 
     attachInterrupt(digitalPinToInterrupt(adcDrdyPin()), drdyIsr, FALLING);
 
-    if (host == nullptr || host[0] == '\0') {
-        Serial.println("[adcstream] no collector configured; sampling only");
+    if (port == 0) {
+        Serial.println("[adcstream] stream disabled; sampling only");
         return true;
     }
 
-    strncpy(s_host, host, sizeof(s_host) - 1);
     s_port = port;
 
     /* Core 0 alongside the network stack, and below it in priority: a late
@@ -528,28 +604,28 @@ bool adcStreamBegin(const char *host, uint16_t port)
         return false;
     }
 
-    Serial.printf("[adcstream] session %08X -> %s:%u\n",
-                  (unsigned)s_session, s_host, (unsigned)s_port);
+    Serial.printf("[adcstream] session %08X, collector dials in on :%u\n",
+                  (unsigned)s_session, (unsigned)s_port);
     return true;
 }
 
 const char *adcStreamFailName(uint8_t stage)
 {
     switch (stage) {
-    case ADCSTREAM_FAIL_NONE:    return "none";
-    case ADCSTREAM_FAIL_RESOLVE: return "resolve";
-    case ADCSTREAM_FAIL_SOCKET:  return "socket";
-    case ADCSTREAM_FAIL_CONNECT: return "connect";
-    case ADCSTREAM_FAIL_TIMEOUT: return "timeout";
-    case ADCSTREAM_FAIL_REFUSED: return "refused";
-    case ADCSTREAM_FAIL_HELLO:   return "hello";
-    default:                     return "?";
+    case ADCSTREAM_FAIL_NONE:   return "none";
+    case ADCSTREAM_FAIL_SOCKET: return "socket";
+    case ADCSTREAM_FAIL_BIND:   return "bind";
+    case ADCSTREAM_FAIL_ACCEPT: return "accept";
+    case ADCSTREAM_FAIL_HELLO:  return "hello";
+    default:                    return "?";
     }
 }
 
 AdcStreamStats adcStreamGetStats(void)
 {
     AdcStreamStats st = {};
+    st.listening     = s_listening;
+    st.port          = s_port;
     st.connected     = s_connected;
     st.connects      = s_connects;
     st.drops         = s_drops;
@@ -558,8 +634,8 @@ AdcStreamStats adcStreamGetStats(void)
     st.framesLost    = s_framesLost;
     st.packets       = s_packets;
     st.session       = s_session;
-    st.attempts      = s_attempts;
     st.lastFailStage = s_failStage;
     st.lastErrno     = s_failErrno;
+    strncpy(st.peer, s_connected ? s_peer : "", sizeof(st.peer) - 1);
     return st;
 }
