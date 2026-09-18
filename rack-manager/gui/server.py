@@ -2,17 +2,26 @@
 """
 Rack manager GUI backend.
 
-Three jobs in one process:
+Four jobs in one process:
 
-  1. terminate the rack-monitor's raw ADC stream (TCP, see firmware/src/wire.h)
-  2. decimate 9615 SPS down to ~10 Hz by block-averaging
-  3. serve the GUI, push blocks to it, and hold the analog front-end config
+  1. find the board on the link and dial its raw ADC stream (firmware/src/wire.h)
+  2. terminate that stream
+  3. decimate 9615 SPS down to ~10 Hz by block-averaging, and run a Welch
+     spectrum over the undecimated samples (spectrum.py)
+  4. serve the GUI, push blocks to it, and hold the analog front-end config
+
+Discovery is the same `avahi-browse _easyota._tcp` the firmware's flash.sh
+uses, and for the same reason: nothing here holds the board's address, so a
+DHCP lease or a rename cannot break the link. The board listens and we dial in
+- TCP does not care which end called connect(), and this way the side that has
+to be found is the one already advertising itself.
 
 Stdlib + numpy only. The browser link is Server-Sent Events rather than a
 WebSocket: the flow is one-directional, SSE needs no handshake, no framing and
 no dependency, and the browser reconnects on its own.
 
-  usage: server.py [--stream-port 9000] [--http-port 8080] [--bind 0.0.0.0]
+  usage: server.py [--board <addr>] [--board-port 9000]
+                   [--http-port 8080] [--bind 0.0.0.0]
 
 No sample data is stored. This is a liveness and plausibility check, not the
 collector. The front-end config *is* persisted, to config.json.
@@ -20,6 +29,7 @@ collector. The front-end config *is* persisted, to config.json.
 
 import argparse
 import asyncio
+import collections
 import copy
 import json
 import mimetypes
@@ -30,6 +40,7 @@ from pathlib import Path
 import numpy as np
 
 import channels as chan
+import spectrum as spec
 
 HERE = Path(__file__).parent
 STATIC = HERE / "static"
@@ -47,6 +58,12 @@ FLAG_CRC_ERR = 1 << 1
 TARGET_HZ = 10.0        # blocks per second pushed to the GUI
 WINDOW_SECONDS = 60     # the GUI's rolling window
 DEFAULT_CLKIN_HZ = 4_000_000
+
+SERVICE = "_easyota._tcp"   # what the board advertises
+BROWSE_TIMEOUT_S = 10.0
+CONNECT_TIMEOUT_S = 5.0
+BACKOFF_MIN_S = 1.0
+BACKOFF_MAX_S = 30.0
 
 
 # --------------------------------------------------------------------------
@@ -149,8 +166,17 @@ class State:
         self.crc = 0
         self.seq = 0
         self.since = 0.0
-        self.token = 0            # identifies the current board connection
-        self.writer = None
+        self.writer = None        # the live board connection, if any
+        self.spectra: spec.Spectra | None = None   # once the rate is known
+        self.spectrum_axis: dict | None = None     # replayed to new clients
+        self.history: spec.History | None = None   # the spectrogram's ring
+        self.history_seconds = float(WINDOW_SECONDS)   # --history-seconds
+        # The series' own ring, replayed alongside the spectrogram's. Without
+        # it a reloaded page shows a full spectrogram above an almost empty
+        # line, and the two plots share an x axis precisely so that they can be
+        # read against each other - which needs both of them to have a past.
+        self.blocks: collections.deque = collections.deque(
+            maxlen=int(WINDOW_SECONDS * TARGET_HZ) + 4)
         self.config = load_config()
         self.subscribers: set[asyncio.Queue] = set()
 
@@ -268,8 +294,8 @@ def pin_volts_per_count(hello: dict) -> np.ndarray:
 
 
 def pin_offsets(hello: dict) -> np.ndarray:
-    """Zero calibration in counts, reported by the board and applied here - the
-    stream itself stays a faithful record of what the chip said."""
+    """Zero calibration in counts, reported by the board and applied here.
+    The stream itself stays a faithful record of what the chip said."""
     off = []
     for adc in hello["adcs"]:
         for ch in adc["channels"]:
@@ -282,37 +308,44 @@ def pin_offsets(hello: dict) -> np.ndarray:
 # --------------------------------------------------------------------------
 
 async def handle_board(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Drain one board connection. Returns True if the handshake landed, which
+    is what the caller resets its backoff on - a board that accepts and then
+    drops the hello must not be redialled at LAN speed."""
     peer = writer.get_extra_info("peername")
     peer_s = f"{peer[0]}:{peer[1]}" if peer else "?"
 
-    # A reconnecting board is the authority on whether the old socket is dead:
-    # it only redials after its own send failed. Rejecting the new connection
-    # because the old one has not finished tearing down just locks us out for a
-    # backoff cycle, so the newcomer takes over instead.
-    if STATE.connected and STATE.writer is not None:
-        print(f"[board] {peer_s} takes over from {STATE.peer}", flush=True)
-        try:
-            STATE.writer.close()
-        except Exception:
-            pass
-
-    STATE.token += 1
-    token = STATE.token
     STATE.writer = writer
-    print(f"[board] connected from {peer_s}", flush=True)
+    got_hello = False
+    print(f"[board] connected to {peer_s}", flush=True)
 
     try:
         head = await reader.readexactly(8)
         if head[:4] != MAGIC_HELLO:
             print(f"[board] expected HELO, got {head[:4]!r}")
-            return
+            return False
         (json_len,) = struct.unpack_from("<I", head, 4)
         hello = json.loads(await reader.readexactly(json_len))
+        got_hello = True
 
         sps = sample_rate(hello)
         block = max(1, round(sps / TARGET_HZ))
         v_per_count = pin_volts_per_count(hello)
         offsets = pin_offsets(hello)
+
+        # The analyzer is per session: its bin spacing is derived from the rate,
+        # so a board that comes back clocked differently gets a new one rather
+        # than a stale axis.
+        spectra = spec.Spectra(sps, NCH)
+        STATE.spectra = spectra
+        STATE.spectrum_axis = spectra.axis()
+
+        # The history ring outlives a reconnect on purpose - a dropout is
+        # exactly the event you want the record of afterwards. Only a change of
+        # axis invalidates it, because columns either side of that are not the
+        # same measurement.
+        nbins = len(spectra.centers)
+        if STATE.history is None or STATE.history.nbins != nbins:
+            STATE.history = spec.History(STATE.history_seconds, nbins, NCH)
 
         STATE.hello = hello
         STATE.sps = sps
@@ -324,8 +357,14 @@ async def handle_board(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         STATE.since = time.monotonic()
         STATE.publish(STATE.status())
 
+        STATE.publish(STATE.spectrum_axis)
+
         print(f"[board] session {hello['session']}, {sps:.1f} SPS, "
               f"block {block} frames -> {sps/block:.2f} Hz", flush=True)
+        print(f"[fft]   {spec.FFT_N}-point, {sps/spec.FFT_N:.3f} Hz bins, "
+              f"{spec.FFT_SEGMENTS}x half-overlapped -> "
+              f"{spectra.span/sps:.2f} s, {len(spectra.centers)} "
+              f"display bins at {spec.SPECTRUM_HZ:g} Hz", flush=True)
 
         pending = np.empty((0, NCH), dtype=np.int32)
         expect_idx = None
@@ -362,17 +401,116 @@ async def handle_board(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     except Exception as e:
         print(f"[board] {peer_s} error: {e!r}", flush=True)
     finally:
-        # Only clear state if this connection is still the current one; a
-        # newer one may already have taken over.
-        if STATE.token == token:
-            STATE.connected = False
-            STATE.peer = ""
-            STATE.writer = None
-            STATE.publish(STATE.status())
+        STATE.connected = False
+        STATE.peer = ""
+        STATE.writer = None
+        STATE.spectra = None      # its ring belongs to the session that filled it
+        STATE.publish(STATE.status())
         try:
             writer.close()
         except Exception:
             pass
+
+    return got_hello
+
+
+# --------------------------------------------------------------------------
+# discovery
+# --------------------------------------------------------------------------
+
+async def discover_board():
+    """One address for the board, or None.
+
+    Parsed exactly as flash.sh parses it, from the same command: avahi-browse
+    -p emits `=;if;proto;name;type;domain;host;addr;port;txt`, one line per
+    interface, so a board answering on two shows up twice.
+
+    flash.sh always asks which device to use, on the grounds that silently
+    picking "the one that answered" is wrong when a second expected board has
+    just dropped off the link. Nothing here can ask, so it takes the first and
+    names the rest in the log instead - and there is meant to be one board.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "avahi-browse", "-rtp", SERVICE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        print("[mdns] avahi-browse not found (install avahi-utils), "
+              "or pass --board <addr>", flush=True)
+        return None
+
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), BROWSE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        proc.kill()
+        print("[mdns] browse timed out", flush=True)
+        return None
+
+    # Keyed by instance name, because one board answering on two interfaces is
+    # two lines and not two boards - a distinction the log has to get right or
+    # it reads as a rack that has grown a second monitor.
+    boards: dict[str, list[str]] = {}
+    for line in out.decode(errors="replace").splitlines():
+        f = line.split(";")
+        if len(f) >= 8 and f[0] == "=" and f[2] == "IPv4":
+            addrs = boards.setdefault(f[3], [])
+            if f[7] not in addrs:
+                addrs.append(f[7])
+
+    if not boards:
+        print(f"[mdns] no {SERVICE} device found "
+              "(is the board up, and avahi-daemon running?)", flush=True)
+        return None
+
+    name, addrs = next(iter(boards.items()))
+    if len(boards) > 1:
+        print(f"[mdns] {len(boards)} boards answered "
+              f"({', '.join(boards)}) - using {name}", flush=True)
+    if len(addrs) > 1:
+        print(f"[mdns] {name} has several addresses "
+              f"({', '.join(addrs)}) - using {addrs[0]}", flush=True)
+    return addrs[0]
+
+
+async def board_client(pinned, port: int):
+    """Find the board, dial it, drain it, repeat.
+
+    The retry loop lives here rather than in the firmware because this is the
+    end that has to find the other one. Rediscovery happens on every cycle, not
+    once at startup: that is what makes a board that has just taken a new lease
+    reappear on its own.
+    """
+    backoff = BACKOFF_MIN_S
+
+    while True:
+        addr = pinned or await discover_board()
+        if addr is not None:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(addr, port), CONNECT_TIMEOUT_S)
+            except (OSError, asyncio.TimeoutError) as e:
+                print(f"[board] {addr}:{port} unreachable: {e!r}", flush=True)
+            else:
+                # Reset only once the connection was good for something. A
+                # board that accepts and immediately drops would otherwise be
+                # retried at full speed forever.
+                if await handle_board(reader, writer):
+                    backoff = BACKOFF_MIN_S
+
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, BACKOFF_MAX_S)
+
+
+def sig(v, digits=7):
+    """One number, at the precision anyone can actually use.
+
+    Unrounded, `repr(float)` spends 17 digits on a value the page prints to
+    five and a 24-bit ADC resolves to about seven. That is invisible in one
+    block and expensive in six hundred: the history replayed on connect was
+    400 KB of mostly trailing noise, and is ~150 KB rounded.
+    """
+    return float(f"{v:.{digits}g}")
 
 
 def emit(block: np.ndarray, v_per_count, offsets, ch_mask):
@@ -408,15 +546,35 @@ def emit(block: np.ndarray, v_per_count, offsets, ch_mask):
 
     out = [
         {
-            "mean": float(mean[i]), "rms": float(rms[i]),
-            "min": float(lo[i]), "max": float(hi[i]),
+            "mean": sig(mean[i]), "rms": sig(rms[i]),
+            "min": sig(lo[i]), "max": sig(hi[i]),
             "ok": bool(ch_mask & (1 << i)),
         }
         for i in range(NCH)
     ]
 
     STATE.seq += 1
-    STATE.publish({"type": "block", "seq": STATE.seq, "t": time.time(), "ch": out})
+    block_msg = {"type": "block", "seq": STATE.seq, "t": time.time(), "ch": out}
+    STATE.blocks.append(block_msg)
+    STATE.publish(block_msg)
+
+    # The frequency-domain view is fed the same volts, undecimated - averaging
+    # to 10 Hz first would leave a 5 Hz Nyquist and nothing to look at. It runs
+    # on its own schedule (every `hop` frames, not every block) and costs ~2.5 ms
+    # when it does fire, which the socket buffer absorbs without a thread.
+    if STATE.spectra is not None and STATE.spectra.push(volts):
+        try:
+            msg, db = STATE.spectra.compute(scale)
+        except Exception as e:
+            print(f"[fft] skipped: {e!r}", flush=True)
+        else:
+            msg["seq"] = STATE.seq
+            msg["t"] = time.time()
+            if STATE.history is not None:
+                STATE.history.push(msg["t"], db)
+            # The browser appends this same column to its own ring, so the
+            # spectrogram needs nothing further on the wire while a page is up.
+            STATE.publish(msg)
 
 
 # --------------------------------------------------------------------------
@@ -457,6 +615,7 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 "hello": STATE.hello,
                 "window_seconds": WINDOW_SECONDS,
                 "target_hz": TARGET_HZ,
+                "spectrum": STATE.spectrum_axis,
             })
         elif method == "POST" and path == "/api/config":
             await post_config(writer, body)
@@ -492,6 +651,8 @@ async def post_config(writer, body: bytes):
         return
 
     STATE.config[idx] = updated
+    if STATE.spectra is not None:
+        STATE.spectra.reset_peak()
     try:
         save_config(STATE.config)
     except OSError as e:
@@ -543,6 +704,18 @@ async def serve_events(writer):
 
     try:
         writer.write(f"data: {json.dumps(STATE.status())}\n\n".encode())
+        # The axis is sent once per session, so a browser that loaded after the
+        # board connected would otherwise have spectra and nowhere to plot them.
+        if STATE.spectrum_axis:
+            writer.write(f"data: {json.dumps(STATE.spectrum_axis)}\n\n".encode())
+        # The past, which the browser cannot reconstruct: it only ever sees what
+        # arrived after it connected. Both rings go, so the two plots that share
+        # an x axis also share a history.
+        bh = blocks_message()
+        if bh is not None:
+            writer.write(f"data: {json.dumps(bh)}\n\n".encode())
+        if STATE.history is not None:
+            writer.write(f"data: {json.dumps(STATE.history.message())}\n\n".encode())
         await writer.drain()
         while True:
             try:
@@ -559,6 +732,37 @@ async def serve_events(writer):
         STATE.subscribers.discard(q)
 
 
+def blocks_message():
+    """The series ring, columnar.
+
+    Replayed as the block messages themselves this is 288 KB for a minute,
+    because `{"mean": ..., "rms": ..., "min": ..., "max": ..., "ok": ...}`
+    repeated 3000 times is mostly key names. One array per field per channel
+    carries the same numbers in about half the bytes, and the saving grows with
+    --history-seconds, which is the knob most likely to be turned up.
+
+    The page expands this back into block shape before ingesting it, so there
+    is still exactly one definition of what a block does to its store.
+    """
+    bl = list(STATE.blocks)
+    if not bl:
+        return None
+    return {
+        "type": "block_history",
+        "t": [b["t"] for b in bl],
+        "ch": [
+            {
+                "mean": [b["ch"][i]["mean"] for b in bl],
+                "rms": [b["ch"][i]["rms"] for b in bl],
+                "min": [b["ch"][i]["min"] for b in bl],
+                "max": [b["ch"][i]["max"] for b in bl],
+                "ok": [int(b["ch"][i]["ok"]) for b in bl],
+            }
+            for i in range(NCH)
+        ],
+    }
+
+
 async def status_ticker():
     while True:
         await asyncio.sleep(1.0)
@@ -569,21 +773,30 @@ async def status_ticker():
 
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stream-port", type=int, default=9000)
+    ap.add_argument("--board", default=None,
+                    help="board address; omit to discover it over mDNS")
+    ap.add_argument("--board-port", type=int, default=9000,
+                    help="stream port on the board (ADC_STREAM_PORT)")
     ap.add_argument("--http-port", type=int, default=8080)
     ap.add_argument("--bind", default="0.0.0.0")
+    ap.add_argument("--history-seconds", type=float, default=WINDOW_SECONDS,
+                    help="spectrogram history kept in RAM; defaults to the "
+                         "time series' own window so the two plots line up")
     args = ap.parse_args()
 
-    board = await asyncio.start_server(handle_board, args.bind, args.stream_port)
+    STATE.history_seconds = max(1.0, args.history_seconds)
+
     http = await asyncio.start_server(handle_http, args.bind, args.http_port)
 
-    print(f"stream  : {args.bind}:{args.stream_port}  (point the board here)")
+    print(f"board   : {args.board or f'discover {SERVICE}'}:{args.board_port}")
     print(f"gui     : http://localhost:{args.http_port}/")
-    print(f"config  : {CONFIG_PATH}", flush=True)
+    print(f"config  : {CONFIG_PATH}")
+    print(f"history : {STATE.history_seconds:g} s of spectra in RAM "
+          f"({STATE.history_seconds * spec.SPECTRUM_HZ:.0f} columns)", flush=True)
 
-    async with board, http:
-        await asyncio.gather(board.serve_forever(), http.serve_forever(),
-                             status_ticker())
+    async with http:
+        await asyncio.gather(http.serve_forever(), status_ticker(),
+                             board_client(args.board, args.board_port))
 
 
 if __name__ == "__main__":

@@ -2,12 +2,17 @@
 """
 Pretend to be the rack-monitor's ADC stream.
 
-Dials a collector, sends the same handshake the firmware sends, then pushes
-real-time packets carrying plausible signals: 50 Hz on the two wall channels,
-DC with ripple on the rails. For developing the GUI without hardware, and for
-checking the collector's decode against a waveform whose answer is known.
+Listens for a collector as the firmware does, sends the same handshake, then
+pushes real-time packets carrying plausible signals: 50 Hz on the two wall
+channels, DC with ripple on the rails. For developing the GUI without hardware,
+and for checking the collector's decode against a waveform whose answer is
+known.
 
-  usage: fakeboard.py [host] [port] [--seconds N]
+  usage: fakeboard.py [port] [--bind 127.0.0.1] [--seconds N]
+
+This does not advertise _easyota._tcp, so point the collector at it directly:
+
+  python3 ../gui/server.py --board 127.0.0.1
 
 Wire format is firmware/src/wire.h.
 """
@@ -78,17 +83,24 @@ def pack_i24le(v):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("host", nargs="?", default="127.0.0.1")
     ap.add_argument("port", nargs="?", type=int, default=9000)
+    ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--seconds", type=float, default=0)
     args = ap.parse_args()
 
-    s = socket.create_connection((args.host, args.port))
+    lsock = socket.socket()
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lsock.bind((args.bind, args.port))
+    lsock.listen(1)
+    print(f"listening on {args.bind}:{args.port}", flush=True)
+
+    s, peer = lsock.accept()
+    lsock.close()
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     blob = json.dumps(HELLO).encode()
     s.sendall(MAGIC_HELLO + struct.pack("<I", len(blob)) + blob)
-    print(f"connected to {args.host}:{args.port}, session {HELLO['session']:08X}",
+    print(f"collector {peer[0]}:{peer[1]}, session {HELLO['session']:08X}",
           flush=True)
 
     idx = 0

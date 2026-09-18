@@ -156,15 +156,18 @@ flowchart LR
 
 | Tier | Rate | Transport | Direction | Retention |
 |---|---|---|---|---|
-| Raw waveform | 9615 Hz, 5 ch | binary over TCP | ESP dials out | collector ring |
+| Raw waveform | 9615 Hz, 5 ch | binary over TCP | collector dials in | collector ring |
 | Aggregates | 5 Hz blocks, 1 Hz rollup | HTTP `/metrics` | collector scrapes | forever |
 | Events | on trigger | JSON push + retry queue | ESP dials out | forever |
 
 ### Raw stream
 
-The ESP is a TCP **client**: it connects to a collector address configured in NVS and
-pushes continuously, reconnecting with backoff. All five live channels, always. ADC3 ch1
-is unused (bus current is derived).
+The ESP is a TCP **server**: it listens on `ADC_STREAM_PORT`, the collector finds it by
+browsing `_easyota._tcp` (the same record `flash.sh` uses) and dials in, and the ESP then
+pushes continuously into the accepted socket. Neither end stores the other's address, so
+a DHCP lease or a rename cannot break the link; the retry and backoff therefore live on
+the collector, which is the end doing the finding. All five live channels, always. ADC3
+ch1 is unused (bus current is derived).
 
 ```
   u32 magic

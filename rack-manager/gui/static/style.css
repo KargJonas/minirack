@@ -17,6 +17,16 @@
   --warning:     #fab219;
   --critical:    #d03b3b;
   --focus:       rgba(42, 120, 214, 0.35);
+
+  /* Spectrogram magnitude: sequential, one hue, blue steps 100 -> 700. Not a
+     rainbow - a rainbow ramp invents boundaries the data does not have. Like
+     the rest of this file the dark ramp is selected, not flipped: --spec-0 is
+     always the quiet end, and in each mode it is the step that recedes toward
+     that mode's own surface (1.29:1 on light, 1.46:1 on dark). */
+  --spec-0:  #cde2fb; --spec-1:  #b7d3f6; --spec-2:  #9ec5f4; --spec-3:  #86b6ef;
+  --spec-4:  #6da7ec; --spec-5:  #5598e7; --spec-6:  #3987e5; --spec-7:  #2a78d6;
+  --spec-8:  #256abf; --spec-9:  #1c5cab; --spec-10: #184f95; --spec-11: #104281;
+  --spec-12: #0d366b;
 }
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) {
@@ -33,6 +43,11 @@
     --series:      #3987e5;
     --series-band: rgba(57, 135, 229, 0.20);
     --focus:       rgba(57, 135, 229, 0.45);
+
+    --spec-0:  #0d366b; --spec-1:  #104281; --spec-2:  #184f95; --spec-3:  #1c5cab;
+    --spec-4:  #256abf; --spec-5:  #2a78d6; --spec-6:  #3987e5; --spec-7:  #5598e7;
+    --spec-8:  #6da7ec; --spec-9:  #86b6ef; --spec-10: #9ec5f4; --spec-11: #b7d3f6;
+    --spec-12: #cde2fb;
   }
 }
 :root[data-theme="dark"] {
@@ -42,6 +57,10 @@
   --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
   --series: #3987e5; --series-band: rgba(57,135,229,0.20);
   --focus: rgba(57,135,229,0.45);
+  --spec-0:  #0d366b; --spec-1:  #104281; --spec-2:  #184f95; --spec-3:  #1c5cab;
+  --spec-4:  #256abf; --spec-5:  #2a78d6; --spec-6:  #3987e5; --spec-7:  #5598e7;
+  --spec-8:  #6da7ec; --spec-9:  #86b6ef; --spec-10: #9ec5f4; --spec-11: #b7d3f6;
+  --spec-12: #cde2fb;
 }
 
 * { box-sizing: border-box; }
@@ -70,7 +89,18 @@ header {
 .stats { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--muted); font-size: 12.5px; }
 .stats b { font-weight: 500; color: var(--ink-2); font-variant-numeric: tabular-nums; }
 
-.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+/* One channel per row, full width. The spectrogram's axis is time, and time is
+   the dimension worth spending width on - a channel tiled three-across gets
+   about a minute of it before columns are thinner than a pixel. */
+.grid { display: grid; gap: 14px; grid-template-columns: 1fr; }
+
+/* Left is the present (value + current spectrum), right is the past (series
+   over spectrogram). The split is the card's whole organising idea. */
+.panes {
+  display: grid; grid-template-columns: minmax(190px, 1fr) 3fr;
+  gap: 18px; align-items: start;
+}
+@media (max-width: 860px) { .panes { grid-template-columns: 1fr; } }
 
 .tile {
   position: relative;
@@ -121,7 +151,42 @@ canvas { display: block; width: 100%; height: 110px; }
   display: flex; flex-direction: column; justify-content: space-between;
   font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums;
 }
-.xlabel { text-align: right; font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+/* ---- spectrum, in the card's left pane ---- */
+canvas.spec { height: 104px; }
+/* The bottom 12px of the spectrum canvas is the decade-label gutter
+   (SPEC_LABEL_H in app.js), so the dB scale has to stop above it. */
+.yaxis.spec { bottom: 12px; }
+
+/* ---- timeline: series + spectrogram in one canvas ---- */
+/* Its height, and where the series' scale stops, are set inline from TL_H and
+   SERIES_H in app.js - the drawing code works in those same numbers, and a
+   second copy here would only be a chance for the two to disagree. */
+.tlfoot {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  font-size: 10.5px; color: var(--ink-2); margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.tlfoot .dim { color: var(--muted); }
+.cbar { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.cbar i {
+  display: block; width: 84px; height: 8px; border-radius: 2px;
+  border: 1px solid var(--border);
+  background: linear-gradient(to right,
+    var(--spec-0), var(--spec-1), var(--spec-2), var(--spec-3), var(--spec-4),
+    var(--spec-5), var(--spec-6), var(--spec-7), var(--spec-8), var(--spec-9),
+    var(--spec-10), var(--spec-11), var(--spec-12));
+}
+.specfoot {
+  display: flex; justify-content: space-between; gap: 10px;
+  font-size: 10.5px; color: var(--ink-2); margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.specfoot .dim { color: var(--muted); }
+.spec-wait {
+  height: 104px; display: flex; align-items: center; justify-content: center;
+  font-size: 11.5px; color: var(--muted);
+}
+
 .tip {
   position: absolute; pointer-events: none;
   background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
@@ -131,7 +196,13 @@ canvas { display: block; width: 100%; height: 110px; }
 }
 
 /* ---- config form ---- */
-.cfg-form { padding-top: 2px; }
+/* Cards are full width now, so the form flows into columns rather than running
+   as one narrow strip down the left of an otherwise empty card. The group
+   headings stay full width so "Front end" and "Correction" still read as
+   headings and not as another field. */
+.cfg-form { padding-top: 2px; columns: 260px 3; column-gap: 22px; }
+.cfg-form > .cfg-scale, .cfg-form > .cfg-group { column-span: all; }
+.field, .cfg-scale { break-inside: avoid; }
 .cfg-scale {
   font-size: 12px; color: var(--ink-2); background: var(--raised);
   border-radius: 6px; padding: 7px 10px; margin-bottom: 12px;

@@ -2,3 +2,4 @@
 **/~*.*.lck
 firmware/secrets.ini
 **/.pio/
+**/__pycache__
